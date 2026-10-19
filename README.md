@@ -1,100 +1,144 @@
 # Sequent
 
-> **Deterministic Event-Sourced Distributed Workflow Engine & Visual Execution Debugger**
+> **Deterministic Event-Sourced Workflow Engine & Visual Execution Debugger**
 
-Sequent executes multi-step directed acyclic graphs (DAGs) with parallel branching, guarantees zero state loss across arbitrary server crashes via deterministic event replay, coordinates forward execution and backward saga rollbacks, and prevents split-brain writes using distributed worker fencing tokens.
+Sequent executes directed acyclic graphs (DAGs) with parallel branching, replays completed work after a crash, coordinates forward execution and backward saga rollbacks, and rejects stale worker writes using per-node fencing tokens.
 
 ---
 
-## Key Capabilities & Architecture
+## Key Capabilities
 
 ### 1. Graph Compilation & Workflow Initialization
-- **DAG Compilation**: Validates linear, branching, and parallel tasks. Performs topological sorting and cycle detection via Kahn's algorithm.
-- **Join Barriers**: Automatically identifies multi-parent join nodes where parallel execution branches must synchronize before proceeding.
-- **Event Sourcing**: Commits an initial `WorkflowExecutionStarted` record (sequence ID = 1) to the append-only `event_log` table.
+- **DAG Compilation**: validates linear, branching, and parallel graphs, then topologically sorts them and detects cycles via Kahn's algorithm.
+- **Join Barriers**: multi-parent join nodes wait for every upstream branch before running.
+- **Event Sourcing**: commits a `WorkflowExecutionStarted` record (sequence ID 1) and every subsequent state transition to the append-only `event_log`.
 
-### 2. Distributed Task Dispatch & Worker Fencing
-- **Monotonic Fencing Tokens**: RAM cache-backed leases with PostgreSQL DB fallback, issued with atomic incrementing fencing tokens (`INCR`).
-- **Heartbeat & TTL**: Workers maintain leases via periodic heartbeat renewals.
-- **Split-Brain Write Rejection**: If a worker suffers a GC pause or network partition, its lease expires and is re-issued with a higher token ($T_{new} > T_{old}$). When the zombie worker attempts to commit its results, the transaction aborts with `WorkerFencingRejected`.
+### 2. Per-Node Worker Fencing
+- **Monotonic tokens**: each `(execution, node)` lease is issued with a strictly increasing fencing token from the RAM cache with a PostgreSQL fallback.
+- **Exclusive leases**: a live lease held by another worker cannot be stolen unless the caller explicitly forces failover (used by the chaos simulation).
+- **Atomic commit validation**: activity checkpoints and completions are validated against the live lease **inside the same transaction** that inserts the event. A stale worker is rejected with `WorkerFencingRejected` before any result is persisted.
+- **Heartbeat watchdog**: if a heartbeat is rejected (lease expired or superseded), the task is aborted immediately instead of running until its final check.
 
-### 3. Deterministic Execution Sandbox & Side-Effect Interception
-- **Deterministic Proxy**: Activities execute inside a sandbox that wraps network requests, timers, randoms, and clocks.
-- **Replay Interception**: The proxy inspects historical events in `event_log`. If a completed event exists for the node, it returns the cached result immediately, executing **zero network calls**.
+### 3. Deterministic Execution Sandbox
+- **Step checkpoints**: each `context.step(...)` writes an `ActivityStepCompleted` event only after the fence check succeeds. Node completion is a separate, single `ActivityCompleted` event.
+- **Replay interception**: historical step results are served from the event log with zero network calls; node-level completion is never inferred from a step checkpoint.
+- **Abortable timers**: `context.sleep(...)` observes an `AbortSignal`, so cancelled tasks stop promptly.
 
-### 4. Parallel Branch Failure & Active Task Cancellation
-- **Sibling Abort Propagation**: When one parallel branch encounters an error, the engine shifts state to `FAILING` and dispatches active `AbortSignal`s to all running sibling tasks.
-- **Graceful Quorum Pause**: The orchestrator waits until all active siblings either finish safely, acknowledge abort, or timeout before initiating rollbacks.
+### 4. Parallel Branch Failure & Real Cancellation
+- When a branch fails, the workflow enters `FAILING`, aborts every running sibling via `AbortSignal`, and waits (bounded) for them to settle before compensation starts.
+- Late results from a killed/finished run are dropped by a per-run identity check, so they cannot write events after a terminal transition.
 
-### 5. Fault-Tolerant Saga Compensation with Retry Backoff
-- **Reverse Topological Rollback**: The engine shifts to `COMPENSATING` and traverses completed steps in reverse topological order (LIFO).
-- **Exponential Backoff**: Transient compensation errors are retried with exponential backoff and jitter ($t = \text{base} \times 2^{\text{attempt}}$).
-- **Poison-Pill Quarantine**: If retries are exhausted, the workflow transitions to `POISON_PILL_BLOCKED`, alerts operators, and quarantines in the manual recovery queue.
+### 5. Fault-Tolerant Saga Compensation
+- **Reverse topological rollback**: completed nodes are compensated in reverse topological order.
+- **Retries**: transient compensation failures retry with exponential backoff and jitter (`retryPolicy` on the node).
+- **Poison-pill quarantine**: exhausted retries create a single pending item per `(execution, node)` and transition the workflow to `POISON_PILL_BLOCKED`.
+- **Strict handlers**: a missing compensation handler is treated as a failure (with retries) rather than a silent success. Demo definitions can opt into a no-op with `metadata.simulatedCompensation = true`.
 
-### 6. Zero-Loss Crash Recovery via Event Replay
-- **Automated Bootstrapping**: On server restart, the engine queries unfinalized workflows (`RUNNING`, `FAILING`, `COMPENSATING`).
-- **Deterministic Replay**: Reconstructs the workflow function state by serving cached outputs from historical `event_log` records until reaching the exact uncommitted node where the crash occurred, resuming live execution.
+### 6. Status-Aware Crash Recovery
+- On boot, `RUNNING`, `FAILING`, and `COMPENSATING` executions are replayed from the shared projection in `src/core/replay.ts`.
+- `RUNNING` resumes forward dispatch from the first uncommitted node; `FAILING`/`COMPENSATING` resume rollback without double-compensating already compensated nodes.
+- One-shot chaos injections (`crashNodeId`, `failNodeId`, `zombieNodeId`, `poisonPillNodeId`) are cleared on replay; only pacing (`stepDelayMs`) is restored.
+- Stale leases left by the previous process are expired before re-dispatch.
 
-### 7. Telemetry Streaming & Time-Travel Debugging
-- **WebSocket Streaming**: Broadcasts state transitions, lease acquisitions, token progression, and compensations over `/ws`.
-- **Interactive DAG Visualizer**: Rendered using XYFlow and Dagre with live token progression along edges and state badges.
-- **Interactive Time-Travel Scrubber**: Rewinds the visual DAG to any historical sequence ID, allowing millisecond-level payload and state inspection.
-- **Chaos Lab**: One-click triggers for **Zombie Worker Split-Brain Rejection**, **Simulated Server Crash & Instant Replay**, and **Parallel Branch Failure Saga Rollback**.
+### 7. Telemetry & Time-Travel Debugging
+- **Execution-scoped WebSocket stream**: the UI ignores frames/events for any execution other than the one it is currently inspecting. The socket is opened once per page; scrubbing time travel does not reconnect.
+- **DAG visualizer**: XYFlow + Dagre layout is computed only when the workflow definition changes, so live state updates do not reset dragged node positions.
+- **Time-travel scrubber**: rewinds the DAG to any sequence ID using the same replay projection as crash recovery.
+- **Chaos Lab**: one-click triggers for zombie-worker rejection, simulated crash & replay, parallel sibling cancellation, and poison-pill quarantine.
 
 ---
 
-## Tech Stack & Setup
+## Tech Stack
 
-- **Runtime**: [Bun](https://bun.sh)
-- **API Framework**: [Elysia](https://elysiajs.com) on Port `3003`
-- **Database ORM**: [Drizzle ORM](https://orm.drizzle.team) with PostgreSQL (`sequent_db`) via Unix Socket (`/var/run/postgresql`) or TCP
-- **Distributed State & Leases**: In-memory RAM Cache with PostgreSQL DB fallback (`worker_leases` table)
-- **Frontend**: [Vite](https://vitejs.dev), [React](https://react.dev), [Tailwind CSS v4](https://tailwindcss.com), [@xyflow/react](https://reactflow.dev), [Radix UI](https://www.radix-ui.com), [Lucide Icons](https://lucide.dev)
-- **Code Standards**: [Biome](https://biomejs.dev)
+- **Runtime**: [Bun](https://bun.sh) (latest)
+- **API**: [Elysia](https://elysiajs.com) on port `3003`
+- **Database**: [Drizzle ORM](https://orm.drizzle.team) + PostgreSQL (`sequent_db`), optional in development (in-memory fallback)
+- **Leases**: RAM cache with PostgreSQL fallback (`worker_leases`)
+- **Frontend**: Vite, React, Tailwind CSS v4, `@xyflow/react`, Radix UI, Lucide
+- **Standards**: Biome
 
 ---
 
 ## Quick Start
 
-### 1. Install Dependencies
+### 1. Install dependencies
 ```bash
 bun install
 ```
 
-### 2. Run in Development
+### 2. Configure environment (optional for in-memory mode)
 ```bash
-# Start Elysia backend server (Port 3003)
-bun run dev
-
-# In another terminal, start Vite frontend
-bun run dev:ui
+cp .env.example .env.development
+# edit PostgreSQL credentials if you want persistence
 ```
 
-### 3. Production Build & Start
+### 3. Run in development
+```bash
+bun run dev      # Elysia API on :3003
+bun run dev:ui   # Vite UI on :5174
+```
+
+### 4. Build & start in production
 ```bash
 bun run build
 bun run start
 ```
 
-### 4. Run Automated Test Suite
+### 5. Database migrations
+```bash
+bun run db:migrate
+```
+Migrations are ordered and idempotent. The migration that installs the unique `(workflow_execution_id, sequence_id)` index also repairs duplicate sequence IDs left by older builds, and collapses duplicate pending poison-pill rows.
+
+### 6. Tests, type checking, and lint
 ```bash
 bun test
+bun run check   # Bun's built-in type checker (reads tsconfig.json)
+bun run lint
 ```
 
-### 5. Type Checking & Linting
+Postgres-specific sequencing tests are opt-in so the default suite runs without a database:
 ```bash
-bun run typecheck
-bun run lint
+TEST_DATABASE_URL=postgres://sequent_user:...@localhost:5432/sequent_db bun run test:pg
 ```
 
 ---
 
-## Deployment (dejis-cloud)
+## Configuration
 
-The repository includes a production-ready multi-stage Bun `Dockerfile` and `docker-compose.yml` with host Unix domain socket volumes mounted for PostgreSQL IPC:
+| Variable | Purpose |
+| --- | --- |
+| `PORT` | API port (default `3003`) |
+| `POSTGRES_*` / `DATABASE_URL` | PostgreSQL connection; without them the engine uses in-memory persistence in development |
+| `CORS_ORIGIN` | Comma-separated allowed origins; unset is permissive for local development |
+| `EXECUTION_RETENTION_MS` | How long terminal executions stay in memory for inspection (default `60000`) |
+| `MAX_TRACKED_EXECUTIONS` | Cap on in-memory execution records (default `200`) |
+
+---
+
+## Safety Model & Limitations
+
+- **Single orchestrator**: workers and leases are simulated in-process. Multi-instance scheduling, Redis coordination, and cross-node ownership are out of scope; the DB lease table is a fallback, not a full distributed lock service.
+- **Per-node fencing tokens**: tokens are scoped to `(execution, node)`, not to a whole workflow. The UI's "Active Fence Token" is the latest token seen for the run.
+- **Conditional nodes/edges are not implemented**: definitions with `type: 'conditional'` or `edge.condition` are rejected at compile time rather than silently ignored.
+- **`retryPolicy` is compensation-scoped**; activity-level retries are not implemented.
+- **Poison-pill resolution resumes the rollback**: “Mark Resolved” retries the failed compensation and then continues with the remaining completions; “Skip” records an explicit `CompensationSkipped` event and continues with the other compensations. Both actions resume from the durable event log and work after a restart. If a retry fails again, the workflow returns to `POISON_PILL_BLOCKED` with a new pending item.
+- **In-memory mode is ephemeral**: a restart loses executions unless PostgreSQL is configured and reachable.
+
+---
+
+## Deployment
+
+The repository includes a multi-stage Bun `Dockerfile` (using the latest Bun image) and a `docker-compose.yml` with host PostgreSQL socket volumes:
 
 ```bash
 docker compose up -d --build
 ```
 
-GitHub Actions workflow `.github/workflows/deploy.yml` deploys to `/opt/sequent` on `dejis-cloud`.
+The GitHub Actions workflow `.github/workflows/deploy.yml` validates, builds, and deploys to `/opt/sequent` on `dejis-cloud`. A separate `.github/workflows/ci.yml` runs `bun check`, `lint:ci`, tests, and the frontend build on pushes and pull requests.
+
+Before deploying, sync the production environment file:
+```bash
+bun run sync:env
+```
+The deploy step fails fast if `/opt/sequent/.env` is missing.

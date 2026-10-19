@@ -7,7 +7,9 @@ describe('Worker Fencing & Split-Brain Prevention', () => {
     const nodeId = 'task_charge';
 
     const lease1 = await leaseManager.acquireLease(execId, nodeId, 'worker_A', 3000);
-    const lease2 = await leaseManager.acquireLease(execId, nodeId, 'worker_B', 3000);
+    const lease2 = await leaseManager.acquireLease(execId, nodeId, 'worker_B', 3000, {
+      force: true,
+    });
 
     expect(lease2.fencingToken).toBeGreaterThan(lease1.fencingToken);
   });
@@ -22,7 +24,9 @@ describe('Worker Fencing & Split-Brain Prevention', () => {
 
     // Worker 1 experiences a simulated long GC pause.
     // Meanwhile, the orchestrator detects timeout and re-assigns the lease to Worker 2 with higher token T2
-    const worker2Lease = await leaseManager.acquireLease(execId, nodeId, 'worker_2', 3000);
+    const worker2Lease = await leaseManager.acquireLease(execId, nodeId, 'worker_2', 3000, {
+      force: true,
+    });
     const t2 = worker2Lease.fencingToken;
     expect(t2).toBeGreaterThan(t1);
 
@@ -32,7 +36,7 @@ describe('Worker Fencing & Split-Brain Prevention', () => {
 
     // Now delayed zombie Worker 1 wakes up and tries to verify its stale token t1
     // It MUST throw FencingTokenMismatchError!
-    expect(leaseManager.verifyFencingToken(execId, nodeId, 'worker_1', t1)).rejects.toThrow(
+    await expect(leaseManager.verifyFencingToken(execId, nodeId, 'worker_1', t1)).rejects.toThrow(
       FencingTokenMismatchError
     );
   });

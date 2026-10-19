@@ -74,6 +74,7 @@ export type EventType =
   | 'WorkflowExecutionStarted'
   | 'ActivityScheduled'
   | 'ActivityStarted'
+  | 'ActivityStepCompleted'
   | 'ActivityCompleted'
   | 'ActivityFailed'
   | 'ActivityCancelled'
@@ -81,6 +82,9 @@ export type EventType =
   | 'CompensationStarted'
   | 'CompensationCompleted'
   | 'CompensationFailed'
+  | 'CompensationSkipped'
+  | 'PoisonPillResolved'
+  | 'PoisonPillSkipped'
   | 'WorkflowFailing'
   | 'WorkflowCompensating'
   | 'WorkflowCompleted'
@@ -106,10 +110,20 @@ export interface EventRecord {
     attempt?: number;
     durationMs?: number;
     error?: string;
+    stepKey?: string;
     [key: string]: any;
   };
   createdAt: Date;
 }
+
+/**
+ * Input accepted by the event store. The sequence ID is allocated atomically by the
+ * repository (never supplied by callers), and `enforceFence` asks the store to validate
+ * the supplied fencing token against the live lease in the same transaction as the insert.
+ */
+export type EventAppendInput = Omit<EventRecord, 'id' | 'createdAt' | 'sequenceId'> & {
+  enforceFence?: boolean;
+};
 
 export interface WorkerLease {
   workflowExecutionId: string;
@@ -159,12 +173,6 @@ export interface TelemetryFrame {
   nodeStates: Record<string, NodeRuntimeState>;
   contextState: Record<string, any>;
   activeLeases: WorkerLease[];
-  activeTokens: Array<{
-    edgeId: string;
-    source: string;
-    target: string;
-    progress: number;
-  }>;
   recentEvents: EventRecord[];
   metrics: {
     totalNodes: number;

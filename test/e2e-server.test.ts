@@ -1,7 +1,12 @@
-import { describe, expect, it } from 'bun:test';
-import { app } from '../src/index';
+import { beforeAll, describe, expect, it } from 'bun:test';
+import { app, ready } from '../src/index';
 
 describe('Sequent Elysia API Server (E2E)', () => {
+  beforeAll(async () => {
+    // Importing the app no longer starts a listener; wait for DB/preset boot instead.
+    await ready;
+  });
+
   it('should return health status', async () => {
     const res = await app.handle(new Request('http://localhost:3003/api/health'));
     expect(res.status).toBe(200);
@@ -60,8 +65,7 @@ describe('Sequent Elysia API Server (E2E)', () => {
   it('should list historical executions with filtering and chaosConfig persistence', async () => {
     // 1. Trigger with chaosConfig
     const chaosConfig = {
-      enableZombieWorker: true,
-      zombieNodeId: 'inventory_reserve',
+      zombieNodeId: 'step_2_zombie_target',
       stepDelayMs: 400,
     };
 
@@ -85,7 +89,7 @@ describe('Sequent Elysia API Server (E2E)', () => {
     const execRecord = await getRes.json();
     expect(execRecord.id).toBe(execId);
     expect(execRecord.chaosConfig).toBeDefined();
-    expect(execRecord.chaosConfig.enableZombieWorker).toBe(true);
+    expect(execRecord.chaosConfig.zombieNodeId).toBe('step_2_zombie_target');
 
     // 3. List historical executions with filter
     const listRes = await app.handle(

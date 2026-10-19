@@ -1,6 +1,8 @@
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, lte, sql } from 'drizzle-orm';
+import { FencingTokenMismatchError } from '../core/errors';
 import type {
   ChaosConfig,
+  EventAppendInput,
   EventRecord,
   PoisonPillItem,
   WorkerLease,
@@ -49,18 +51,21 @@ export interface IWorkflowRepository {
   listExecutions(options?: number | ExecutionFilterOptions, offset?: number): Promise<any[]>;
   getUnfinalizedExecutions(): Promise<any[]>;
 
-  appendEvent(event: Omit<EventRecord, 'id' | 'createdAt'>): Promise<EventRecord>;
+  appendEvent(event: EventAppendInput): Promise<EventRecord>;
   getEventLog(executionId: string): Promise<EventRecord[]>;
   getEventsUpToSequence(executionId: string, maxSequenceId: number): Promise<EventRecord[]>;
 
   addPoisonPill(item: Omit<PoisonPillItem, 'id' | 'blockedAt'>): Promise<PoisonPillItem>;
   listPoisonPillItems(): Promise<PoisonPillItem[]>;
-  resolvePoisonPill(id: string, status: 'RESOLVED' | 'SKIPPED'): Promise<boolean>;
+  getPoisonPill(id: string): Promise<PoisonPillItem | null>;
+  hasPendingPoisonPill(executionId: string, nodeId: string): Promise<boolean>;
+  resolvePoisonPill(id: string, status: 'RESOLVED' | 'SKIPPED'): Promise<PoisonPillItem | null>;
 
   saveLease(lease: WorkerLease): Promise<void>;
   getLease(executionId: string, nodeId: string): Promise<WorkerLease | null>;
   updateLeaseHeartbeat(executionId: string, nodeId: string, expiresAt: number): Promise<void>;
   releaseLease(executionId: string, nodeId: string): Promise<void>;
+  expireLease(executionId: string, nodeId: string): Promise<void>;
   getActiveLeases(): Promise<WorkerLease[]>;
   getHighestFencingToken(executionId: string, nodeId: string): Promise<number>;
 }
@@ -148,7 +153,29 @@ class InMemoryWorkflowRepository implements IWorkflowRepository {
     return Array.from(this.executions.values()).filter((ex) => activeStatuses.has(ex.status));
   }
 
-  async appendEvent(event: Omit<EventRecord, 'id' | 'createdAt'>): Promise<EventRecord> {
+  private validateFence(event: EventAppendInput): void {
+    if (!event.enforceFence || !event.nodeId) return;
+    const token = event.metadata.fencingToken;
+    if (token === undefined) return;
+
+    const lease = this.leases.get(`${event.workflowExecutionId}:${event.nodeId}`);
+    const workerId = event.metadata.workerId || 'unknown';
+    if (!lease) {
+      throw new FencingTokenMismatchError(0, token, event.nodeId, workerId);
+    }
+    if (
+      lease.status !== 'active' ||
+      lease.expiresAt < Date.now() ||
+      lease.fencingToken !== token ||
+      lease.workerId !== workerId
+    ) {
+      throw new FencingTokenMismatchError(lease.fencingToken, token, event.nodeId, workerId);
+    }
+  }
+
+  async appendEvent(event: EventAppendInput): Promise<EventRecord> {
+    this.validateFence(event);
+
     let logs = this.eventLogs.get(event.workflowExecutionId);
     if (!logs) {
       logs = [];
@@ -158,14 +185,15 @@ class InMemoryWorkflowRepository implements IWorkflowRepository {
     const nextSeq = (this.sequenceCounters.get(event.workflowExecutionId) || 0) + 1;
     this.sequenceCounters.set(event.workflowExecutionId, nextSeq);
 
+    const { enforceFence: _enforceFence, ...stored } = event;
     const record: EventRecord = {
       id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
-      workflowExecutionId: event.workflowExecutionId,
+      workflowExecutionId: stored.workflowExecutionId,
       sequenceId: nextSeq,
-      eventType: event.eventType,
-      nodeId: event.nodeId,
-      payload: event.payload,
-      metadata: event.metadata,
+      eventType: stored.eventType,
+      nodeId: stored.nodeId,
+      payload: stored.payload,
+      metadata: stored.metadata,
       createdAt: new Date(),
     };
 
@@ -207,12 +235,31 @@ class InMemoryWorkflowRepository implements IWorkflowRepository {
     return Array.from(this.poisonPillQueue.values()).sort((a, b) => b.blockedAt - a.blockedAt);
   }
 
-  async resolvePoisonPill(id: string, status: 'RESOLVED' | 'SKIPPED'): Promise<boolean> {
+  async getPoisonPill(id: string): Promise<PoisonPillItem | null> {
     const item = this.poisonPillQueue.get(id);
-    if (!item) return false;
+    return item ? { ...item } : null;
+  }
+
+  async hasPendingPoisonPill(executionId: string, nodeId: string): Promise<boolean> {
+    return Array.from(this.poisonPillQueue.values()).some(
+      (item) =>
+        item.workflowExecutionId === executionId &&
+        item.nodeId === nodeId &&
+        item.status === 'PENDING'
+    );
+  }
+
+  async resolvePoisonPill(
+    id: string,
+    status: 'RESOLVED' | 'SKIPPED'
+  ): Promise<PoisonPillItem | null> {
+    const item = this.poisonPillQueue.get(id);
+    // Only a pending item can transition; this makes concurrent resolutions idempotent.
+    if (!item) return null;
+    if (item.status !== 'PENDING') return null;
     item.status = status;
     this.poisonPillQueue.set(id, item);
-    return true;
+    return { ...item };
   }
 
   async saveLease(lease: WorkerLease): Promise<void> {
@@ -252,6 +299,14 @@ class InMemoryWorkflowRepository implements IWorkflowRepository {
     }
   }
 
+  async expireLease(executionId: string, nodeId: string): Promise<void> {
+    const key = `${executionId}:${nodeId}`;
+    const lease = this.leases.get(key);
+    if (lease) {
+      lease.status = 'expired';
+    }
+  }
+
   async getActiveLeases(): Promise<WorkerLease[]> {
     const now = Date.now();
     const active: WorkerLease[] = [];
@@ -273,6 +328,47 @@ class InMemoryWorkflowRepository implements IWorkflowRepository {
 
 class PostgresWorkflowRepository implements IWorkflowRepository {
   private memFallback = new InMemoryWorkflowRepository();
+
+  private mapEventRow(r: schema.EventLogRecord): EventRecord {
+    return {
+      id: r.id,
+      workflowExecutionId: r.workflowExecutionId,
+      sequenceId: r.sequenceId,
+      eventType: r.eventType as any,
+      nodeId: r.nodeId || undefined,
+      payload: r.payload as any,
+      metadata: r.metadata as any,
+      createdAt: r.createdAt,
+    };
+  }
+
+  private mapPoisonPillRow(r: schema.PoisonPillRecord): PoisonPillItem {
+    return {
+      id: r.id,
+      workflowExecutionId: r.workflowExecutionId,
+      nodeId: r.nodeId,
+      activityType: r.activityType,
+      compensationType: r.compensationType,
+      attempts: r.attempts,
+      lastError: r.lastError,
+      payload: r.payload as any,
+      status: r.status as any,
+      blockedAt: r.blockedAt.getTime(),
+    };
+  }
+
+  private mapLeaseRow(r: schema.WorkerLeaseRecord): WorkerLease {
+    return {
+      workflowExecutionId: r.workflowExecutionId,
+      nodeId: r.nodeId,
+      workerId: r.workerId,
+      fencingToken: r.fencingToken,
+      acquiredAt: r.acquiredAt.getTime(),
+      expiresAt: r.expiresAt.getTime(),
+      ttlMs: r.ttlMs,
+      status: r.status as any,
+    };
+  }
 
   async saveDefinition(def: WorkflowDefinition): Promise<void> {
     const db = await getDb();
@@ -395,21 +491,20 @@ class PostgresWorkflowRepository implements IWorkflowRepository {
       conditions.push(eq(schema.workflowExecutionsTable.status, opts.status));
     }
 
-    const query = db
-      .select()
-      .from(schema.workflowExecutionsTable)
+    const where =
+      conditions.length === 1
+        ? conditions[0]
+        : conditions.length > 1
+          ? and(...conditions)
+          : undefined;
+
+    const base = db.select().from(schema.workflowExecutionsTable);
+    const filtered = where ? base.where(where) : base;
+
+    return filtered
       .orderBy(desc(schema.workflowExecutionsTable.startedAt))
       .limit(limit)
       .offset(offset);
-
-    if (conditions.length === 1) {
-      return (query as any).where(conditions[0]);
-    }
-    if (conditions.length > 1) {
-      return (query as any).where(and(...conditions));
-    }
-
-    return query;
   }
 
   async getUnfinalizedExecutions(): Promise<any[]> {
@@ -424,54 +519,87 @@ class PostgresWorkflowRepository implements IWorkflowRepository {
       );
   }
 
-  async appendEvent(event: Omit<EventRecord, 'id' | 'createdAt'>): Promise<EventRecord> {
+  async appendEvent(event: EventAppendInput): Promise<EventRecord> {
     const db = await getDb();
     if (!db || !isDbConnected()) return this.memFallback.appendEvent(event);
 
-    // Get current max sequence id atomically
-    const latestEvents = await db
-      .select({ seq: schema.eventLogTable.sequenceId })
-      .from(schema.eventLogTable)
-      .where(eq(schema.eventLogTable.workflowExecutionId, event.workflowExecutionId))
-      .orderBy(desc(schema.eventLogTable.sequenceId))
-      .limit(1);
+    return db.transaction(async (tx) => {
+      // 1. Atomically validate the worker's fence against the live lease (if required)
+      if (event.enforceFence && event.nodeId) {
+        const claimedToken = event.metadata.fencingToken;
+        const workerId = event.metadata.workerId || 'unknown';
+        if (claimedToken !== undefined) {
+          const leaseId = `${event.workflowExecutionId}:${event.nodeId}`;
+          const [lease] = await tx
+            .select()
+            .from(schema.workerLeasesTable)
+            .where(eq(schema.workerLeasesTable.id, leaseId))
+            .for('update');
 
-    const nextSeq = (latestEvents[0]?.seq || 0) + 1;
-    const id = `evt_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+          if (!lease) {
+            throw new FencingTokenMismatchError(0, claimedToken, event.nodeId, workerId);
+          }
+          if (
+            lease.status !== 'active' ||
+            lease.expiresAt.getTime() < Date.now() ||
+            lease.fencingToken !== claimedToken ||
+            lease.workerId !== workerId
+          ) {
+            throw new FencingTokenMismatchError(
+              lease.fencingToken,
+              claimedToken,
+              event.nodeId,
+              workerId
+            );
+          }
+        }
+      }
 
-    const [inserted] = await db
-      .insert(schema.eventLogTable)
-      .values({
-        id,
-        workflowExecutionId: event.workflowExecutionId,
-        sequenceId: nextSeq,
-        nodeId: event.nodeId,
-        eventType: event.eventType,
-        payload: event.payload,
-        metadata: event.metadata,
-      })
-      .returning();
+      // 2. Allocate the next sequence ID atomically on the execution row
+      const token = event.metadata.fencingToken;
+      const [updatedExec] = await tx
+        .update(schema.workflowExecutionsTable)
+        .set({
+          currentSequenceId: sql`${schema.workflowExecutionsTable.currentSequenceId} + 1`,
+          ...(token !== undefined
+            ? {
+                activeFencingToken: sql`GREATEST(${schema.workflowExecutionsTable.activeFencingToken}, ${token})`,
+              }
+            : {}),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.workflowExecutionsTable.id, event.workflowExecutionId))
+        .returning({ sequenceId: schema.workflowExecutionsTable.currentSequenceId });
 
-    // Update execution pointer
-    await db
-      .update(schema.workflowExecutionsTable)
-      .set({
-        currentSequenceId: nextSeq,
-        activeFencingToken: event.metadata.fencingToken || undefined,
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.workflowExecutionsTable.id, event.workflowExecutionId));
+      let nextSeq = updatedExec?.sequenceId;
+      if (nextSeq === undefined) {
+        const [latest] = await tx
+          .select({ seq: schema.eventLogTable.sequenceId })
+          .from(schema.eventLogTable)
+          .where(eq(schema.eventLogTable.workflowExecutionId, event.workflowExecutionId))
+          .orderBy(desc(schema.eventLogTable.sequenceId))
+          .limit(1);
+        nextSeq = (latest?.seq || 0) + 1;
+      }
 
-    return {
-      id: inserted.id,
-      workflowExecutionId: inserted.workflowExecutionId,
-      sequenceId: inserted.sequenceId,
-      eventType: inserted.eventType as any,
-      nodeId: inserted.nodeId || undefined,
-      payload: inserted.payload as any,
-      metadata: inserted.metadata as any,
-      createdAt: inserted.createdAt,
-    };
+      // 3. Insert the event
+      const id = `evt_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+      const { enforceFence: _enforceFence, ...stored } = event;
+      const [inserted] = await tx
+        .insert(schema.eventLogTable)
+        .values({
+          id,
+          workflowExecutionId: stored.workflowExecutionId,
+          sequenceId: nextSeq,
+          nodeId: stored.nodeId,
+          eventType: stored.eventType,
+          payload: stored.payload,
+          metadata: stored.metadata,
+        })
+        .returning();
+
+      return this.mapEventRow(inserted);
+    });
   }
 
   async getEventLog(executionId: string): Promise<EventRecord[]> {
@@ -484,16 +612,7 @@ class PostgresWorkflowRepository implements IWorkflowRepository {
       .where(eq(schema.eventLogTable.workflowExecutionId, executionId))
       .orderBy(asc(schema.eventLogTable.sequenceId));
 
-    return rows.map((r) => ({
-      id: r.id,
-      workflowExecutionId: r.workflowExecutionId,
-      sequenceId: r.sequenceId,
-      eventType: r.eventType as any,
-      nodeId: r.nodeId || undefined,
-      payload: r.payload as any,
-      metadata: r.metadata as any,
-      createdAt: r.createdAt,
-    }));
+    return rows.map((r) => this.mapEventRow(r));
   }
 
   async getEventsUpToSequence(executionId: string, maxSequenceId: number): Promise<EventRecord[]> {
@@ -504,21 +623,15 @@ class PostgresWorkflowRepository implements IWorkflowRepository {
     const rows = await db
       .select()
       .from(schema.eventLogTable)
-      .where(eq(schema.eventLogTable.workflowExecutionId, executionId))
+      .where(
+        and(
+          eq(schema.eventLogTable.workflowExecutionId, executionId),
+          lte(schema.eventLogTable.sequenceId, maxSequenceId)
+        )
+      )
       .orderBy(asc(schema.eventLogTable.sequenceId));
 
-    return rows
-      .filter((r) => r.sequenceId <= maxSequenceId)
-      .map((r) => ({
-        id: r.id,
-        workflowExecutionId: r.workflowExecutionId,
-        sequenceId: r.sequenceId,
-        eventType: r.eventType as any,
-        nodeId: r.nodeId || undefined,
-        payload: r.payload as any,
-        metadata: r.metadata as any,
-        createdAt: r.createdAt,
-      }));
+    return rows.map((r) => this.mapEventRow(r));
   }
 
   async addPoisonPill(item: Omit<PoisonPillItem, 'id' | 'blockedAt'>): Promise<PoisonPillItem> {
@@ -541,18 +654,7 @@ class PostgresWorkflowRepository implements IWorkflowRepository {
       })
       .returning();
 
-    return {
-      id: inserted.id,
-      workflowExecutionId: inserted.workflowExecutionId,
-      nodeId: inserted.nodeId,
-      activityType: inserted.activityType,
-      compensationType: inserted.compensationType,
-      attempts: inserted.attempts,
-      lastError: inserted.lastError,
-      payload: inserted.payload as any,
-      status: inserted.status as any,
-      blockedAt: inserted.blockedAt.getTime(),
-    };
+    return this.mapPoisonPillRow(inserted);
   }
 
   async listPoisonPillItems(): Promise<PoisonPillItem[]> {
@@ -564,33 +666,63 @@ class PostgresWorkflowRepository implements IWorkflowRepository {
       .from(schema.poisonPillQueueTable)
       .orderBy(desc(schema.poisonPillQueueTable.blockedAt));
 
-    return rows.map((r) => ({
-      id: r.id,
-      workflowExecutionId: r.workflowExecutionId,
-      nodeId: r.nodeId,
-      activityType: r.activityType,
-      compensationType: r.compensationType,
-      attempts: r.attempts,
-      lastError: r.lastError,
-      payload: r.payload as any,
-      status: r.status as any,
-      blockedAt: r.blockedAt.getTime(),
-    }));
+    return rows.map((r) => this.mapPoisonPillRow(r));
   }
 
-  async resolvePoisonPill(id: string, status: 'RESOLVED' | 'SKIPPED'): Promise<boolean> {
+  async getPoisonPill(id: string): Promise<PoisonPillItem | null> {
+    const db = await getDb();
+    if (!db || !isDbConnected()) return this.memFallback.getPoisonPill(id);
+
+    const rows = await db
+      .select()
+      .from(schema.poisonPillQueueTable)
+      .where(eq(schema.poisonPillQueueTable.id, id))
+      .limit(1);
+
+    return rows[0] ? this.mapPoisonPillRow(rows[0]) : null;
+  }
+
+  async hasPendingPoisonPill(executionId: string, nodeId: string): Promise<boolean> {
+    const db = await getDb();
+    if (!db || !isDbConnected()) return this.memFallback.hasPendingPoisonPill(executionId, nodeId);
+
+    const rows = await db
+      .select({ id: schema.poisonPillQueueTable.id })
+      .from(schema.poisonPillQueueTable)
+      .where(
+        and(
+          eq(schema.poisonPillQueueTable.workflowExecutionId, executionId),
+          eq(schema.poisonPillQueueTable.nodeId, nodeId),
+          eq(schema.poisonPillQueueTable.status, 'PENDING')
+        )
+      )
+      .limit(1);
+
+    return rows.length > 0;
+  }
+
+  async resolvePoisonPill(
+    id: string,
+    status: 'RESOLVED' | 'SKIPPED'
+  ): Promise<PoisonPillItem | null> {
     const db = await getDb();
     if (!db || !isDbConnected()) return this.memFallback.resolvePoisonPill(id, status);
 
-    await db
+    const [updated] = await db
       .update(schema.poisonPillQueueTable)
       .set({
         status,
         resolvedAt: new Date(),
       })
-      .where(eq(schema.poisonPillQueueTable.id, id));
+      .where(
+        and(
+          eq(schema.poisonPillQueueTable.id, id),
+          eq(schema.poisonPillQueueTable.status, 'PENDING')
+        )
+      )
+      .returning();
 
-    return true;
+    return updated ? this.mapPoisonPillRow(updated) : null;
   }
 
   async saveLease(lease: WorkerLease): Promise<void> {
@@ -636,17 +768,7 @@ class PostgresWorkflowRepository implements IWorkflowRepository {
       .where(eq(schema.workerLeasesTable.id, id));
 
     if (rows.length === 0) return null;
-    const r = rows[0];
-    return {
-      workflowExecutionId: r.workflowExecutionId,
-      nodeId: r.nodeId,
-      workerId: r.workerId,
-      fencingToken: r.fencingToken,
-      acquiredAt: r.acquiredAt.getTime(),
-      expiresAt: r.expiresAt.getTime(),
-      ttlMs: r.ttlMs,
-      status: r.status as any,
-    };
+    return this.mapLeaseRow(rows[0]);
   }
 
   async updateLeaseHeartbeat(
@@ -682,28 +804,35 @@ class PostgresWorkflowRepository implements IWorkflowRepository {
       .where(eq(schema.workerLeasesTable.id, id));
   }
 
+  async expireLease(executionId: string, nodeId: string): Promise<void> {
+    const db = await getDb();
+    if (!db || !isDbConnected()) return this.memFallback.expireLease(executionId, nodeId);
+
+    const id = `${executionId}:${nodeId}`;
+    await db
+      .update(schema.workerLeasesTable)
+      .set({
+        status: 'expired',
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.workerLeasesTable.id, id));
+  }
+
   async getActiveLeases(): Promise<WorkerLease[]> {
     const db = await getDb();
     if (!db || !isDbConnected()) return this.memFallback.getActiveLeases();
 
-    const now = new Date();
     const rows = await db
       .select()
       .from(schema.workerLeasesTable)
-      .where(eq(schema.workerLeasesTable.status, 'active'));
+      .where(
+        and(
+          eq(schema.workerLeasesTable.status, 'active'),
+          gt(schema.workerLeasesTable.expiresAt, new Date())
+        )
+      );
 
-    return rows
-      .filter((r) => r.expiresAt.getTime() > now.getTime())
-      .map((r) => ({
-        workflowExecutionId: r.workflowExecutionId,
-        nodeId: r.nodeId,
-        workerId: r.workerId,
-        fencingToken: r.fencingToken,
-        acquiredAt: r.acquiredAt.getTime(),
-        expiresAt: r.expiresAt.getTime(),
-        ttlMs: r.ttlMs,
-        status: r.status as any,
-      }));
+    return rows.map((r) => this.mapLeaseRow(r));
   }
 
   async getHighestFencingToken(executionId: string, nodeId: string): Promise<number> {

@@ -1,6 +1,6 @@
 import type { EventRecord } from '@core/types';
 import { Pause, Play, SkipBack, SkipForward } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { formatTime } from '../lib/utils';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
@@ -26,8 +26,18 @@ export function TimeTravelSlider({
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
 
-  const maxSeq = events.length > 0 ? events[events.length - 1].sequenceId : 1;
+  // Navigate by actual event sequences instead of assuming a contiguous +1.
+  const sequences = useMemo(
+    () => Array.from(new Set(events.map((event) => event.sequenceId))).sort((a, b) => a - b),
+    [events]
+  );
+  const minSeq = sequences[0] ?? 1;
+  const maxSeq = sequences[sequences.length - 1] ?? 1;
   const activeSeq = isTimeTraveling ? currentSequence : maxSeq;
+  const activeIndex = sequences.indexOf(activeSeq);
+  const previousSeq = activeIndex > 0 ? sequences[activeIndex - 1] : (sequences[0] ?? activeSeq);
+  const nextSeq =
+    activeIndex >= 0 && activeIndex < sequences.length - 1 ? sequences[activeIndex + 1] : maxSeq;
 
   // Auto playback loop
   useEffect(() => {
@@ -35,15 +45,15 @@ export function TimeTravelSlider({
 
     const intervalMs = Math.max(200, Math.floor(1000 / playbackSpeed));
     const timer = setInterval(() => {
-      if (activeSeq < maxSeq) {
-        onScrub(activeSeq + 1);
+      if (nextSeq > activeSeq) {
+        onScrub(nextSeq);
       } else {
         setIsPlaying(false);
       }
     }, intervalMs);
 
     return () => clearInterval(timer);
-  }, [isPlaying, activeSeq, maxSeq, playbackSpeed, onScrub]);
+  }, [isPlaying, activeSeq, nextSeq, playbackSpeed, onScrub]);
 
   if (events.length === 0) {
     return null;
@@ -76,8 +86,8 @@ export function TimeTravelSlider({
           <Button
             size="xs"
             variant="outline"
-            onClick={() => onScrub(Math.max(1, activeSeq - 1))}
-            disabled={activeSeq <= 1}
+            onClick={() => onScrub(previousSeq)}
+            disabled={activeSeq <= minSeq}
             title="Step Back"
             className="h-8 w-8 p-0"
           >
@@ -89,7 +99,7 @@ export function TimeTravelSlider({
             variant={isPlaying ? 'destructive-subtle' : 'outline'}
             onClick={() => {
               if (activeSeq >= maxSeq && !isPlaying) {
-                onScrub(1);
+                onScrub(minSeq);
               }
               setIsPlaying(!isPlaying);
             }}
@@ -103,7 +113,7 @@ export function TimeTravelSlider({
           <Button
             size="xs"
             variant="outline"
-            onClick={() => onScrub(Math.min(maxSeq, activeSeq + 1))}
+            onClick={() => onScrub(nextSeq)}
             disabled={activeSeq >= maxSeq}
             title="Step Forward"
             className="h-8 w-8 p-0"
@@ -147,7 +157,7 @@ export function TimeTravelSlider({
       <div className="space-y-2 pt-1">
         <Slider
           value={[activeSeq]}
-          min={1}
+          min={minSeq}
           max={maxSeq}
           step={1}
           onValueChange={(val) => {
@@ -158,7 +168,7 @@ export function TimeTravelSlider({
         />
 
         <div className="flex items-center justify-between text-xs font-mono text-muted-foreground">
-          <span>Seq #1</span>
+          <span>Seq #{minSeq}</span>
           <span>
             {timeTravelSnapshot?.metadata?.timestamp
               ? formatTime(timeTravelSnapshot.metadata.timestamp)

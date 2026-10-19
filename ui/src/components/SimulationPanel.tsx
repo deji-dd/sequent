@@ -171,8 +171,8 @@ export function SimulationPanel({
                   'poison_pill_quarantine_demo',
                   {
                     stepDelayMs: 1200,
-                    failNodeId: 'reserve_inventory',
-                    poisonPillNodeId: 'reserve_inventory',
+                    failNodeId: 'step_2_execute',
+                    poisonPillNodeId: 'step_1_prepare',
                   },
                   'Poison Pill Quarantine & Retry Exhaustion'
                 )

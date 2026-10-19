@@ -98,7 +98,7 @@ export function PastTestsModal({
   const getChaosBadge = (chaosConfig?: any) => {
     if (!chaosConfig) return null;
 
-    if (chaosConfig.enableZombieWorker || chaosConfig.zombieNodeId) {
+    if (chaosConfig.zombieNodeId) {
       return (
         <Badge variant="purple" className="text-[11px] gap-1">
           <Skull className="size-3" />
@@ -106,7 +106,7 @@ export function PastTestsModal({
         </Badge>
       );
     }
-    if (chaosConfig.enableProcessCrash || chaosConfig.crashNodeId) {
+    if (chaosConfig.crashNodeId) {
       return (
         <Badge variant="amber" className="text-[11px] gap-1">
           <Zap className="size-3" />
@@ -114,7 +114,7 @@ export function PastTestsModal({
         </Badge>
       );
     }
-    if (chaosConfig.enableSimulatedFailure || chaosConfig.failNodeId) {
+    if (chaosConfig.failNodeId) {
       return (
         <Badge variant="rose" className="text-[11px] gap-1">
           <Activity className="size-3" />
@@ -122,7 +122,7 @@ export function PastTestsModal({
         </Badge>
       );
     }
-    if (chaosConfig.enablePoisonPill || chaosConfig.poisonPillNodeId) {
+    if (chaosConfig.poisonPillNodeId) {
       return (
         <Badge variant="destructive" className="text-[11px] gap-1">
           <AlertCircle className="size-3" />
@@ -205,6 +205,15 @@ export function PastTestsModal({
     });
   };
 
+  const hasChaos = (chaosConfig?: any) =>
+    Boolean(
+      chaosConfig &&
+        (chaosConfig.zombieNodeId ||
+          chaosConfig.crashNodeId ||
+          chaosConfig.failNodeId ||
+          chaosConfig.poisonPillNodeId)
+    );
+
   const filteredExecutions = executions.filter((ex) => {
     if (filter === 'completed') return ex.status === 'COMPLETED';
     if (filter === 'failed')
@@ -214,13 +223,7 @@ export function PastTestsModal({
         ex.status === 'POISON_PILL_BLOCKED'
       );
     if (filter === 'chaos') {
-      return (
-        ex.chaosConfig &&
-        (ex.chaosConfig.enableZombieWorker ||
-          ex.chaosConfig.enableProcessCrash ||
-          ex.chaosConfig.enableSimulatedFailure ||
-          ex.chaosConfig.enablePoisonPill)
-      );
+      return hasChaos(ex.chaosConfig);
     }
     return true;
   });
@@ -272,18 +275,7 @@ export function PastTestsModal({
                 )
               </ToggleGroupItem>
               <ToggleGroupItem value="chaos" className="text-xs px-2.5 h-7">
-                Chaos Injected (
-                {
-                  executions.filter(
-                    (e) =>
-                      e.chaosConfig &&
-                      (e.chaosConfig.enableZombieWorker ||
-                        e.chaosConfig.enableProcessCrash ||
-                        e.chaosConfig.enableSimulatedFailure ||
-                        e.chaosConfig.enablePoisonPill)
-                  ).length
-                }
-                )
+                Chaos Injected ({executions.filter((e) => hasChaos(e.chaosConfig)).length})
               </ToggleGroupItem>
             </ToggleGroup>
           </div>

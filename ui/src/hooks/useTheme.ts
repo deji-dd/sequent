@@ -7,7 +7,7 @@ export function useTheme() {
     if (typeof window !== 'undefined') {
       const stored = localStorage.getItem('sequent_theme');
       if (stored === 'light' || stored === 'dark') return stored;
-      return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'dark';
+      return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
     }
     return 'dark';
   });

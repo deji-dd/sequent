@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { DagCanvas } from './components/DagCanvas';
 import { EventLogViewer } from './components/EventLogViewer';
 import { Header } from './components/Header';
@@ -43,13 +43,18 @@ export function App() {
   const [isTestConfigOpen, setIsTestConfigOpen] = useState<boolean>(false);
   const [isHistoryOpen, setIsHistoryOpen] = useState<boolean>(false);
 
+  // Keep the callback identity stable so DagCanvas does not re-render needlessly.
+  const handleZombieClick = useCallback(
+    (nodeId: string) => {
+      void triggerZombieDelay(nodeId);
+    },
+    [triggerZombieDelay]
+  );
+
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col antialiased">
       {/* Top Navigation Header */}
       <Header
-        workflows={workflows}
-        selectedWorkflow={selectedWorkflow}
-        onSelectWorkflow={setSelectedWorkflow}
         workflowStatus={workflowStatus}
         activeExecutionId={activeExecutionId}
         isDark={isDark}
@@ -93,7 +98,7 @@ export function App() {
           <DagCanvas
             workflow={selectedWorkflow}
             nodeStates={nodeStates}
-            onZombieClick={(nodeId) => triggerZombieDelay(nodeId)}
+            onZombieClick={handleZombieClick}
             isDark={isDark}
           />
 

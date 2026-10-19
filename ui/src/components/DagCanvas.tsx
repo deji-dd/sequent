@@ -11,12 +11,14 @@ import {
 import '@xyflow/react/dist/style.css';
 import type { NodeRuntimeState, WorkflowDefinition, WorkflowEdge, WorkflowNode } from '@core/types';
 import dagre from '@dagrejs/dagre';
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { CustomDagNode } from './CustomDagNode';
 
 const nodeTypes = {
   customDagNode: CustomDagNode,
 };
+
+const IDLE_STATE: NodeRuntimeState = { status: 'IDLE', attempts: 0 };
 
 interface DagCanvasProps {
   workflow: WorkflowDefinition | null;
@@ -28,10 +30,12 @@ interface DagCanvasProps {
 export function DagCanvas({ workflow, nodeStates, onZombieClick, isDark = true }: DagCanvasProps) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  const workflowIdRef = useRef<string | null>(null);
 
-  // Layout calculation with dagre
-  const layoutedElements = useMemo(() => {
-    if (!workflow?.nodes) return { nodes: [], edges: [] };
+  // Layout is computed only when the workflow definition changes. Telemetry frames
+  // must not trigger Dagre (it is relatively expensive and would reset drag positions).
+  const layout = useMemo(() => {
+    if (!workflow?.nodes) return { layoutNodes: [] as Node[] };
 
     const dagreGraph = new dagre.graphlib.Graph();
     dagreGraph.setDefaultEdgeLabel(() => ({}));
@@ -52,8 +56,6 @@ export function DagCanvas({ workflow, nodeStates, onZombieClick, isDark = true }
 
     const layoutNodes: Node[] = workflow.nodes.map((n: WorkflowNode) => {
       const nodeWithPos = dagreGraph.node(n.id);
-      const state = nodeStates[n.id] || { status: 'IDLE', attempts: 0 };
-
       return {
         id: n.id,
         type: 'customDagNode',
@@ -63,13 +65,55 @@ export function DagCanvas({ workflow, nodeStates, onZombieClick, isDark = true }
         },
         data: {
           node: n,
-          state,
-          onZombieClick,
+          state: IDLE_STATE,
         },
       };
     });
 
-    const layoutEdges: Edge[] = workflow.edges.map((e: WorkflowEdge) => {
+    return { layoutNodes };
+  }, [workflow]);
+
+  // Merge live state into the stable layout. Existing positions (including user drags)
+  // are preserved unless the workflow itself changed.
+  useEffect(() => {
+    if (!workflow) {
+      setNodes([]);
+      setEdges([]);
+      workflowIdRef.current = null;
+      return;
+    }
+
+    const workflowChanged = workflowIdRef.current !== workflow.id;
+    workflowIdRef.current = workflow.id;
+
+    setNodes((prev) => {
+      const previousById = new Map(prev.map((node) => [node.id, node]));
+      return layout.layoutNodes.map((layoutNode) => {
+        const state = nodeStates[layoutNode.id] || IDLE_STATE;
+        const previous = workflowChanged ? undefined : previousById.get(layoutNode.id);
+        return {
+          ...layoutNode,
+          ...(previous
+            ? {
+                position: previous.position,
+                selected: previous.selected,
+                dragging: previous.dragging,
+              }
+            : {}),
+          data: {
+            ...layoutNode.data,
+            state,
+            onZombieClick,
+          },
+        };
+      });
+    });
+  }, [workflow, layout, nodeStates, onZombieClick, setNodes, setEdges]);
+
+  // Edge styling is cheap and can follow live state every frame.
+  const layoutEdges = useMemo<Edge[]>(() => {
+    if (!workflow) return [];
+    return workflow.edges.map((e: WorkflowEdge) => {
       const sourceState = nodeStates[e.source];
       const targetState = nodeStates[e.target];
 
@@ -77,7 +121,10 @@ export function DagCanvas({ workflow, nodeStates, onZombieClick, isDark = true }
       const isTargetActive =
         targetState?.status === 'RUNNING' || targetState?.status === 'SCHEDULED';
       const isCompensating =
-        sourceState?.status === 'COMPENSATING' || targetState?.status === 'COMPENSATING';
+        sourceState?.status === 'COMPENSATING' ||
+        sourceState?.status === 'COMPENSATED' ||
+        targetState?.status === 'COMPENSATING' ||
+        targetState?.status === 'COMPENSATED';
 
       let strokeColor = isDark ? 'rgba(148, 163, 184, 0.25)' : 'rgba(100, 116, 139, 0.25)';
       let isAnimated = false;
@@ -104,14 +151,11 @@ export function DagCanvas({ workflow, nodeStates, onZombieClick, isDark = true }
         },
       };
     });
-
-    return { nodes: layoutNodes, edges: layoutEdges };
-  }, [workflow, nodeStates, onZombieClick, isDark]);
+  }, [workflow, nodeStates, isDark]);
 
   useEffect(() => {
-    setNodes(layoutedElements.nodes);
-    setEdges(layoutedElements.edges);
-  }, [layoutedElements, setNodes, setEdges]);
+    setEdges(layoutEdges);
+  }, [layoutEdges, setEdges]);
 
   if (!workflow) {
     return (

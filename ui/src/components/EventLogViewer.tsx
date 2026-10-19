@@ -33,6 +33,8 @@ export function EventLogViewer({ events }: EventLogViewerProps) {
       case 'WorkflowExecutionStarted':
       case 'WorkflowCompleted':
         return <Badge variant="emerald">{type}</Badge>;
+      case 'ActivityStepCompleted':
+        return <Badge variant="glass">Step Checkpoint</Badge>;
       case 'ActivityCompleted':
         return <Badge variant="cyan">{type}</Badge>;
       case 'ActivityFailed':
@@ -40,12 +42,22 @@ export function EventLogViewer({ events }: EventLogViewerProps) {
         return <Badge variant="rose">{type}</Badge>;
       case 'ActivityCancelled':
         return <Badge variant="amber">{type}</Badge>;
+      case 'WorkflowFailing':
+        return <Badge variant="rose">{type}</Badge>;
+      case 'WorkerLeaseExpired':
+        return <Badge variant="amber">Lease Expired</Badge>;
       case 'WorkflowCompensating':
       case 'CompensationStarted':
       case 'CompensationCompleted':
         return <Badge variant="purple">{type}</Badge>;
+      case 'CompensationSkipped':
+        return <Badge variant="amber">Compensation Skipped</Badge>;
       case 'WorkflowPoisonPillBlocked':
         return <Badge variant="destructive">{type}</Badge>;
+      case 'PoisonPillResolved':
+        return <Badge variant="emerald">Poison Pill Resolved</Badge>;
+      case 'PoisonPillSkipped':
+        return <Badge variant="amber">Poison Pill Skipped</Badge>;
       case 'WorkerFencingRejected':
         return <Badge variant="rose">Fencing Rejected</Badge>;
       case 'WorkflowRecoveredFromCrash':
@@ -89,13 +101,19 @@ export function EventLogViewer({ events }: EventLogViewerProps) {
             className="h-8 bg-background border border-border rounded-md px-2.5 text-xs text-foreground outline-none cursor-pointer focus:border-primary transition-colors"
           >
             <option value="ALL">All Event Types</option>
+            <option value="ActivityStepCompleted">ActivityStepCompleted</option>
             <option value="ActivityCompleted">ActivityCompleted</option>
             <option value="ActivityFailed">ActivityFailed</option>
+            <option value="WorkerLeaseExpired">WorkerLeaseExpired</option>
             <option value="WorkerFencingRejected">WorkerFencingRejected</option>
+            <option value="WorkflowFailing">WorkflowFailing</option>
             <option value="WorkflowCompensating">WorkflowCompensating</option>
             <option value="CompensationCompleted">CompensationCompleted</option>
+            <option value="CompensationSkipped">CompensationSkipped</option>
             <option value="WorkflowRecoveredFromCrash">WorkflowRecoveredFromCrash</option>
             <option value="WorkflowPoisonPillBlocked">WorkflowPoisonPillBlocked</option>
+            <option value="PoisonPillResolved">PoisonPillResolved</option>
+            <option value="PoisonPillSkipped">PoisonPillSkipped</option>
           </select>
         </div>
       </CardHeader>

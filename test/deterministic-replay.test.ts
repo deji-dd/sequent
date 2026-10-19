@@ -26,8 +26,10 @@ describe('Deterministic Execution Sandbox & Replay Interception', () => {
     // Instantiate proxy with historical log
     const proxy = new DeterministicProxy([historicalEvent]);
 
-    const context = proxy.createContext('exec_replay_1', 'node_fetch_rates', async () => {
-      throw new Error('Should not commit event during replaying of completed step');
+    const context = proxy.createContext('exec_replay_1', 'node_fetch_rates', {
+      recordStepEvent: async () => {
+        throw new Error('Should not commit event during replaying of completed step');
+      },
     });
 
     // Invoke step

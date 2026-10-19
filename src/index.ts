@@ -1,20 +1,76 @@
 import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { cors } from '@elysiajs/cors';
 import { staticPlugin } from '@elysiajs/static';
 import { Elysia } from 'elysia';
 import { CrashRecoveryCoordinator } from './core/crash-recovery';
+import { DAGCompilationError, DAGCompiler } from './core/dag-compiler';
+import { PoisonPillResolutionError } from './core/errors';
 import { orchestrator } from './core/orchestrator';
 import { PRESET_WORKFLOWS } from './core/presets';
+import { projectEvents } from './core/replay';
 import { telemetryBroadcaster } from './core/telemetry';
-import type { WorkflowDefinition } from './core/types';
-import { initDb, isDbConnected } from './db';
+import type { ChaosConfig, WorkflowDefinition } from './core/types';
+import { closeDb, initDb, isDbConnected, pingDb } from './db';
 import { workflowRepository } from './db/repository';
 
 const PORT = Number(process.env.PORT || 3003);
-const _isProd = process.env.NODE_ENV === 'production';
+const DIST_DIR = path.resolve(import.meta.dir, '../dist');
 
-// Initialize DB and Seed Presets on Boot
-(async () => {
+let bootCompleted = false;
+
+function isObject(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function validateChaosConfig(
+  definition: WorkflowDefinition,
+  raw: unknown
+): { config?: ChaosConfig; error?: string } {
+  if (raw === undefined || raw === null) return {};
+  if (!isObject(raw)) return { error: 'chaosConfig must be an object' };
+
+  const nodeIds = new Set(definition.nodes.map((node) => node.id));
+  const references: Array<keyof ChaosConfig> = [
+    'zombieNodeId',
+    'crashNodeId',
+    'failNodeId',
+    'poisonPillNodeId',
+  ];
+
+  for (const key of references) {
+    const value = raw[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'string' || !nodeIds.has(value)) {
+      return { error: `chaosConfig.${key} must reference an existing node in this workflow` };
+    }
+  }
+
+  if (
+    raw.stepDelayMs !== undefined &&
+    (typeof raw.stepDelayMs !== 'number' ||
+      !Number.isFinite(raw.stepDelayMs) ||
+      raw.stepDelayMs < 0)
+  ) {
+    return { error: 'chaosConfig.stepDelayMs must be a non-negative number' };
+  }
+
+  return {
+    config: {
+      stepDelayMs: raw.stepDelayMs,
+      zombieNodeId: raw.zombieNodeId,
+      crashNodeId: raw.crashNodeId,
+      failNodeId: raw.failNodeId,
+      poisonPillNodeId: raw.poisonPillNodeId,
+    },
+  };
+}
+
+/**
+ * Boots persistence and crash recovery. Exported so tests can await readiness
+ * without starting a real listener.
+ */
+export async function bootstrap(): Promise<void> {
   try {
     await initDb();
     for (const preset of PRESET_WORKFLOWS) {
@@ -24,20 +80,31 @@ const _isProd = process.env.NODE_ENV === 'production';
     await CrashRecoveryCoordinator.recoverUnfinalizedWorkflows();
   } catch (err) {
     console.error('[Sequent Boot] Error initializing database or presets:', err);
+  } finally {
+    bootCompleted = true;
   }
-})();
+}
+
+export const ready = bootstrap();
 
 export const app = new Elysia()
-  .use(cors())
+  .use(
+    cors({
+      origin: process.env.CORS_ORIGIN
+        ? process.env.CORS_ORIGIN.split(',')
+        : process.env.NODE_ENV !== 'production',
+    })
+  )
 
   // Health and System Diagnostics
-  .get('/api/health', () => ({
+  .get('/api/health', async () => ({
     status: 'ok',
     service: 'sequent',
     port: PORT,
     timestamp: Date.now(),
     uptime: process.uptime(),
-    dbConnected: isDbConnected(),
+    ready: bootCompleted,
+    dbConnected: isDbConnected() ? await pingDb() : false,
   }))
 
   .get('/api/stats', () => ({
@@ -64,10 +131,12 @@ export const app = new Elysia()
   .post('/api/workflows', async ({ body, set }) => {
     try {
       const def = body as WorkflowDefinition;
-      if (!def.id || !def.name || !Array.isArray(def.nodes)) {
+      if (!isObject(def) || !def.id || !def.name || !Array.isArray(def.nodes)) {
         set.status = 400;
         return { error: 'Invalid workflow definition format' };
       }
+      // Validate the graph before persisting it so cycles/duplicate IDs fail fast.
+      DAGCompiler.compile(def);
       await workflowRepository.saveDefinition(def);
       return { success: true, definition: def };
     } catch (err: any) {
@@ -84,16 +153,26 @@ export const app = new Elysia()
       return { error: 'Workflow definition not found' };
     }
 
+    const bodyObj = isObject(body) ? body : {};
+    const chaos = validateChaosConfig(def, bodyObj.chaosConfig);
+    if (chaos.error) {
+      set.status = 400;
+      return { error: chaos.error };
+    }
+
     try {
-      const inputPayload = (body as any)?.input || { triggeredAt: Date.now() };
-      const chaosConfig = (body as any)?.chaosConfig;
-      const outcome = await orchestrator.startWorkflow(def, inputPayload, undefined, chaosConfig);
+      const inputPayload = isObject(bodyObj.input) ? bodyObj.input : { triggeredAt: Date.now() };
+      const outcome = await orchestrator.startWorkflow(def, inputPayload, undefined, chaos.config);
       return {
         success: true,
         executionId: outcome.executionId,
         status: outcome.status,
       };
     } catch (err: any) {
+      if (err instanceof DAGCompilationError) {
+        set.status = 400;
+        return { error: err.message };
+      }
       set.status = 500;
       return { error: err.message };
     }
@@ -121,14 +200,32 @@ export const app = new Elysia()
     return execution;
   })
 
-  .get('/api/executions/:id/events', async ({ params }) => {
-    return workflowRepository.getEventLog(params.id);
+  .get('/api/executions/:id/events', async ({ params, query, set }) => {
+    const execution = await workflowRepository.getExecution(params.id);
+    if (!execution) {
+      set.status = 404;
+      return { error: 'Execution not found' };
+    }
+
+    let events = await workflowRepository.getEventLog(params.id);
+
+    const afterSequence = Number(query?.afterSequence);
+    if (Number.isFinite(afterSequence) && afterSequence > 0) {
+      events = events.filter((evt) => evt.sequenceId > afterSequence);
+    }
+
+    const limitRaw = Number(query?.limit);
+    if (Number.isFinite(limitRaw) && limitRaw > 0) {
+      events = events.slice(0, Math.min(1000, Math.floor(limitRaw)));
+    }
+
+    return events;
   })
 
   // Time-Travel Debugging Endpoint: Rewind graph and state to a specific sequenceId
   .get('/api/executions/:id/time-travel', async ({ params, query, set }) => {
     const targetSeq = Number(query?.sequenceId);
-    if (Number.isNaN(targetSeq) || targetSeq < 1) {
+    if (!Number.isInteger(targetSeq) || targetSeq < 1) {
       set.status = 400;
       return { error: 'Valid sequenceId parameter required' };
     }
@@ -139,44 +236,20 @@ export const app = new Elysia()
       return { error: 'Execution not found' };
     }
 
-    const events = await workflowRepository.getEventsUpToSequence(params.id, targetSeq);
-
-    // Reconstruct state at target sequence ID
-    const replayedNodeStates: Record<string, any> = {};
-    const contextState = { ...execution.inputPayload };
-
-    for (const evt of events) {
-      if (evt.nodeId) {
-        if (!replayedNodeStates[evt.nodeId]) {
-          replayedNodeStates[evt.nodeId] = { status: 'IDLE' };
-        }
-        if (evt.eventType === 'WorkerLeaseAcquired') {
-          replayedNodeStates[evt.nodeId].status = 'RUNNING';
-          replayedNodeStates[evt.nodeId].fencingToken = evt.metadata?.fencingToken;
-        } else if (evt.eventType === 'ActivityCompleted') {
-          replayedNodeStates[evt.nodeId].status = 'COMPLETED';
-          replayedNodeStates[evt.nodeId].output = evt.payload?.result;
-          contextState[evt.nodeId] = evt.payload?.result;
-        } else if (evt.eventType === 'ActivityFailed') {
-          replayedNodeStates[evt.nodeId].status = 'FAILED';
-          replayedNodeStates[evt.nodeId].error = evt.payload?.error;
-        } else if (evt.eventType === 'ActivityCancelled') {
-          replayedNodeStates[evt.nodeId].status = 'CANCELLED';
-        } else if (evt.eventType === 'CompensationCompleted') {
-          replayedNodeStates[evt.nodeId].status = 'COMPENSATED';
-        } else if (evt.eventType === 'WorkerFencingRejected') {
-          replayedNodeStates[evt.nodeId].status = 'FAILED';
-          replayedNodeStates[evt.nodeId].error =
-            'Split-Brain Write Rejected (Fencing Token Mismatch)';
-        }
-      }
+    const definition = await workflowRepository.getDefinition(execution.workflowDefinitionId);
+    if (!definition) {
+      set.status = 404;
+      return { error: 'Workflow definition for this execution was not found' };
     }
+
+    const events = await workflowRepository.getEventsUpToSequence(params.id, targetSeq);
+    const projection = projectEvents(events, definition, execution.inputPayload || {}, 'timeline');
 
     return {
       executionId: params.id,
       sequenceId: targetSeq,
-      nodeStates: replayedNodeStates,
-      contextState,
+      nodeStates: projection.nodeStates,
+      contextState: projection.contextState,
       eventSnapshot: events[events.length - 1] || null,
       totalReplayedEvents: events.length,
     };
@@ -184,8 +257,8 @@ export const app = new Elysia()
 
   // Simulation Controls: Trigger Zombie delay on a node
   .post('/api/executions/:id/simulate-zombie', async ({ params, body, set }) => {
-    const nodeId = (body as any)?.nodeId;
-    if (!nodeId) {
+    const nodeId = isObject(body) ? body.nodeId : undefined;
+    if (!nodeId || typeof nodeId !== 'string') {
       set.status = 400;
       return { error: 'nodeId is required to simulate zombie delay' };
     }
@@ -221,13 +294,30 @@ export const app = new Elysia()
   })
 
   .post('/api/poison-pill/:id/resolve', async ({ params, body, set }) => {
-    const action = (body as any)?.action || 'RESOLVED';
-    const ok = await workflowRepository.resolvePoisonPill(params.id, action);
-    if (!ok) {
-      set.status = 404;
-      return { error: 'Poison pill item not found' };
+    const requested = isObject(body) ? body.action : undefined;
+    const action = requested === undefined ? 'RESOLVED' : requested;
+    if (action !== 'RESOLVED' && action !== 'SKIPPED') {
+      set.status = 400;
+      return { error: "action must be either 'RESOLVED' or 'SKIPPED'" };
     }
-    return { success: true, status: action };
+
+    try {
+      const result = await orchestrator.resolvePoisonPill(params.id, action);
+      return {
+        success: true,
+        action,
+        status: result.status,
+        executionId: result.executionId,
+        item: result.item,
+      };
+    } catch (err: any) {
+      if (err instanceof PoisonPillResolutionError) {
+        set.status = err.code === 'not_found' ? 404 : 409;
+        return { error: err.message, code: err.code };
+      }
+      set.status = 500;
+      return { error: err.message };
+    }
   })
 
   // Real-Time WebSocket Telemetry
@@ -257,11 +347,16 @@ export const app = new Elysia()
   });
 
 // Serve static frontend in production if dist exists
-if (existsSync('dist')) {
-  app.use(staticPlugin({ assets: 'dist', prefix: '/' }));
+if (existsSync(DIST_DIR)) {
+  app.use(staticPlugin({ assets: DIST_DIR, prefix: '/' }));
   // Fallback route for SPA client-side routing
-  app.get('*', ({ set }) => {
-    const htmlPath = 'dist/index.html';
+  app.get('*', ({ request, set }) => {
+    // Unknown API routes must not fall through to the SPA shell.
+    if (new URL(request.url).pathname.startsWith('/api/')) {
+      set.status = 404;
+      return { error: 'Not Found' };
+    }
+    const htmlPath = path.join(DIST_DIR, 'index.html');
     if (existsSync(htmlPath)) {
       set.headers['content-type'] = 'text/html';
       return Bun.file(htmlPath);
@@ -271,9 +366,32 @@ if (existsSync('dist')) {
   });
 }
 
-app.listen(PORT);
+if (import.meta.main) {
+  ready
+    .then(() => {
+      app.listen(PORT);
+      console.log(`Sequent Engine online at http://localhost:${PORT}`);
+      console.log(`WebSocket Telemetry: ws://localhost:${PORT}/ws`);
+    })
+    .catch((err) => {
+      console.error('[Sequent] Failed to start:', err);
+      process.exit(1);
+    });
 
-console.log(`Sequent Engine online at http://localhost:${PORT}`);
-console.log(`WebSocket Telemetry: ws://localhost:${PORT}/ws`);
+  const shutdown = async (signal: string) => {
+    console.log(`[Sequent] ${signal} received, shutting down...`);
+    orchestrator.shutdown();
+    try {
+      await app.stop();
+    } catch {
+      // Ignore stop errors during shutdown.
+    }
+    await closeDb();
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+}
 
 export type App = typeof app;

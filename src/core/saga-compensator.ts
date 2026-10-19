@@ -62,6 +62,10 @@ export class SagaCompensator {
         originalOutput: state.output,
       });
 
+      // Surface the rollback in the UI before the first handler attempt.
+      state.status = 'COMPENSATING';
+      state.compensationAttempts = 0;
+
       const handler = this.handlers.get(node.compensationType);
       const retryPolicy = node.retryPolicy || {
         maxRetries: 3,
@@ -75,6 +79,7 @@ export class SagaCompensator {
 
       while (attempt <= retryPolicy.maxRetries) {
         attempt++;
+        state.compensationAttempts = attempt;
         await onCompensationEvent('CompensationStarted', nodeId, {
           attempt,
           compensationType: node.compensationType,
@@ -89,8 +94,8 @@ export class SagaCompensator {
 
           if (handler) {
             await handler(node, state.input, state.output, attempt);
-          } else {
-            // Default simulated compensation
+          } else if (node.metadata?.simulatedCompensation === true) {
+            // Explicit opt-in for demo definitions that do not register a real handler.
             if (
               node.metadata?.compensationFailureProbability &&
               Math.random() < node.metadata.compensationFailureProbability
@@ -99,6 +104,10 @@ export class SagaCompensator {
                 `Downstream compensation error during ${node.compensationType} on node ${nodeId}`
               );
             }
+          } else {
+            throw new Error(
+              `No compensation handler registered for '${node.compensationType}' on node '${nodeId}'. Register one via sagaCompensator.registerHandler() or set metadata.simulatedCompensation=true.`
+            );
           }
 
           state.isCompensated = true;
@@ -136,19 +145,24 @@ export class SagaCompensator {
       if (!compensated) {
         state.status = 'POISON_PILL_BLOCKED';
 
-        await workflowRepository.addPoisonPill({
-          workflowExecutionId: executionId,
-          nodeId,
-          activityType: node.activityType,
-          compensationType: node.compensationType,
-          attempts: attempt,
-          lastError,
-          payload: {
-            input: state.input,
-            output: state.output,
-          },
-          status: 'PENDING',
-        });
+        // Recovery can resume compensation; never create a second pending row for
+        // the same execution/node.
+        const alreadyPending = await workflowRepository.hasPendingPoisonPill(executionId, nodeId);
+        if (!alreadyPending) {
+          await workflowRepository.addPoisonPill({
+            workflowExecutionId: executionId,
+            nodeId,
+            activityType: node.activityType,
+            compensationType: node.compensationType,
+            attempts: attempt,
+            lastError,
+            payload: {
+              input: state.input,
+              output: state.output,
+            },
+            status: 'PENDING',
+          });
+        }
 
         await onCompensationEvent('WorkflowPoisonPillBlocked', nodeId, {
           nodeId,

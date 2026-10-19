@@ -1,12 +1,9 @@
-import type { WorkflowDefinition, WorkflowStatus } from '@core/types';
+import type { WorkflowStatus } from '@core/types';
 import { AlertCircle, History, Loader2, Moon, Play, Sliders, Sun } from 'lucide-react';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 
 interface HeaderProps {
-  workflows: WorkflowDefinition[];
-  selectedWorkflow: WorkflowDefinition | null;
-  onSelectWorkflow: (def: WorkflowDefinition) => void;
   workflowStatus: WorkflowStatus;
   activeExecutionId: string | null;
   isDark: boolean;
@@ -19,7 +16,6 @@ interface HeaderProps {
 }
 
 export function Header({
-  onSelectWorkflow: _onSelectWorkflow,
   workflowStatus,
   activeExecutionId,
   isDark,

@@ -68,6 +68,22 @@ export class RamCache {
     return Math.max(0, item.expiresAt - Date.now());
   }
 
+  /**
+   * Removes expired entries eagerly. Called periodically by the lease manager so
+   * abandoned keys do not accumulate over a long-running process.
+   */
+  sweep(): number {
+    const now = Date.now();
+    let removed = 0;
+    for (const [key, item] of this.store.entries()) {
+      if (item.expiresAt !== undefined && now > item.expiresAt) {
+        this.store.delete(key);
+        removed++;
+      }
+    }
+    return removed;
+  }
+
   clear(): void {
     this.store.clear();
   }

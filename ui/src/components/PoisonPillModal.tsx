@@ -73,12 +73,17 @@ export function PoisonPillModal({ open, onOpenChange }: PoisonPillModalProps) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
       });
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
-        setActionMessage(`Poison pill item marked as ${action}.`);
+        const verb = action === 'RESOLVED' ? 'retried' : 'skipped';
+        setActionMessage(`Compensation ${verb}. Workflow status: ${data.status ?? 'updated'}.`);
         await fetchItems();
+      } else {
+        setActionMessage(data.error || `Failed to resolve item (HTTP ${res.status}).`);
       }
     } catch (err) {
       console.error('Failed to resolve poison pill:', err);
+      setActionMessage('Failed to resolve item: network error.');
     } finally {
       setResolvingId(null);
     }

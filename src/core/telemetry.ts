@@ -2,10 +2,6 @@ import type { EventRecord, TelemetryFrame, WorkflowStatus } from './types';
 
 export class TelemetryBroadcaster {
   private sockets = new Set<any>();
-  private activeTokensMap = new Map<
-    string,
-    Array<{ edgeId: string; source: string; target: string; progress: number }>
-  >();
 
   addSocket(ws: any) {
     this.sockets.add(ws);
@@ -19,22 +15,7 @@ export class TelemetryBroadcaster {
     return this.sockets.size;
   }
 
-  setTokenProgression(
-    executionId: string,
-    tokens: Array<{ edgeId: string; source: string; target: string; progress: number }>
-  ) {
-    this.activeTokensMap.set(executionId, tokens);
-  }
-
-  clearTokens(executionId: string) {
-    this.activeTokensMap.delete(executionId);
-  }
-
   broadcast(frame: TelemetryFrame) {
-    // Attach current active animated edge tokens
-    const tokens = this.activeTokensMap.get(frame.workflowExecutionId) || [];
-    frame.activeTokens = tokens;
-
     const payload = JSON.stringify({
       type: 'TELEMETRY_FRAME',
       data: frame,

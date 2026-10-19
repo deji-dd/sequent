@@ -8,6 +8,16 @@ import type {
   WorkflowStatus,
 } from '@core/types';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { isMessageForActiveExecution } from '../lib/telemetry';
+
+const EMPTY_METRICS = {
+  totalNodes: 0,
+  completedNodes: 0,
+  failedNodes: 0,
+  compensatedNodes: 0,
+  zombieWritesBlocked: 0,
+  crashesRecovered: 0,
+};
 
 export function useWorkflowEngine() {
   const [workflows, setWorkflows] = useState<WorkflowDefinition[]>([]);
@@ -20,14 +30,7 @@ export function useWorkflowEngine() {
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [contextState, setContextState] = useState<Record<string, any>>({});
   const [activeChaosConfig, setActiveChaosConfig] = useState<ChaosConfig | null>(null);
-  const [metrics, setMetrics] = useState({
-    totalNodes: 0,
-    completedNodes: 0,
-    failedNodes: 0,
-    compensatedNodes: 0,
-    zombieWritesBlocked: 0,
-    crashesRecovered: 0,
-  });
+  const [metrics, setMetrics] = useState(EMPTY_METRICS);
 
   // Time-Travel Debugging State
   const [isTimeTraveling, setIsTimeTraveling] = useState<boolean>(false);
@@ -43,78 +46,128 @@ export function useWorkflowEngine() {
   const [historicalExecution, setHistoricalExecution] = useState<any | null>(null);
 
   const [isConnected, setIsConnected] = useState<boolean>(false);
-  const wsRef = useRef<WebSocket | null>(null);
 
-  // Fetch available workflows
+  // Refs keep the WebSocket handler stable (no reconnect storm while scrubbing).
+  const wsRef = useRef<WebSocket | null>(null);
+  const activeExecutionIdRef = useRef<string | null>(null);
+  const isTimeTravelingRef = useRef<boolean>(false);
+  const isHistoricalViewRef = useRef<boolean>(false);
+
+  const setActiveExecution = useCallback((executionId: string | null) => {
+    activeExecutionIdRef.current = executionId;
+    setActiveExecutionId(executionId);
+  }, []);
+
+  const setTimeTraveling = useCallback((value: boolean) => {
+    isTimeTravelingRef.current = value;
+    setIsTimeTraveling(value);
+  }, []);
+
+  const setHistoricalView = useCallback((value: boolean) => {
+    isHistoricalViewRef.current = value;
+    setIsHistoricalView(value);
+  }, []);
+
+  const resetDerivedState = useCallback(() => {
+    setEvents([]);
+    setNodeStates({});
+    setContextState({});
+    setActiveLeases([]);
+    setActiveFencingToken(0);
+    setMetrics(EMPTY_METRICS);
+  }, []);
+
+  // Fetch available workflows (stable: no selectedWorkflow dependency)
   const fetchWorkflows = useCallback(async () => {
     try {
       const res = await fetch('/api/workflows');
       if (res.ok) {
         const list: WorkflowDefinition[] = await res.json();
         setWorkflows(list);
-        if (list.length > 0 && !selectedWorkflow) {
-          setSelectedWorkflow(list[0]);
-        }
+        setSelectedWorkflow((prev) => prev ?? list[0] ?? null);
       }
     } catch (err) {
       console.error('Error fetching workflows:', err);
     }
-  }, [selectedWorkflow]);
+  }, []);
 
-  // Connect WebSocket
+  // Connect WebSocket exactly once per mount.
   useEffect(() => {
     fetchWorkflows();
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws`;
 
-    let ws: WebSocket;
-    let reconnectTimeout: any;
+    let shouldReconnect = true;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+    let reconnectDelay = 2000;
+    let ws: WebSocket | null = null;
+
+    function scheduleReconnect() {
+      if (!shouldReconnect) return;
+      reconnectTimeout = setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(15000, Math.round(reconnectDelay * 1.5));
+    }
 
     function connect() {
+      if (!shouldReconnect) return;
       ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
+        reconnectDelay = 2000;
         setIsConnected(true);
       };
 
       ws.onclose = () => {
         setIsConnected(false);
-        reconnectTimeout = setTimeout(connect, 2000);
+        wsRef.current = null;
+        scheduleReconnect();
       };
 
       ws.onerror = () => {
-        ws.close();
+        ws?.close();
       };
 
       ws.onmessage = (event) => {
         try {
-          // If the user is inspecting a past execution, ignore live telemetry stream
-          if (isHistoricalView) return;
+          // Historical inspection is a static snapshot: ignore live traffic.
+          if (isHistoricalViewRef.current) return;
 
           const msg = JSON.parse(event.data);
           if (msg.type === 'TELEMETRY_FRAME') {
+            // While scrubbing, keep the replayed state but continue collecting events.
+            if (isTimeTravelingRef.current) return;
             const frame: TelemetryFrame = msg.data;
-            if (!isTimeTraveling) {
-              setWorkflowStatus(frame.status);
-              setNodeStates(frame.nodeStates);
-              setActiveLeases(frame.activeLeases || []);
-              setActiveFencingToken(frame.activeFencingToken || 0);
-              setContextState(frame.contextState || {});
-              if (frame.metrics) setMetrics(frame.metrics);
+            if (
+              !isMessageForActiveExecution(frame.workflowExecutionId, activeExecutionIdRef.current)
+            ) {
+              return;
             }
+            setWorkflowStatus(frame.status);
+            setNodeStates(frame.nodeStates);
+            setActiveLeases(frame.activeLeases || []);
+            setActiveFencingToken(frame.activeFencingToken || 0);
+            setContextState(frame.contextState || {});
+            if (frame.metrics) setMetrics(frame.metrics);
           } else if (msg.type === 'EVENT_RECORD') {
             const evt: EventRecord = msg.data;
+            if (
+              !isMessageForActiveExecution(evt.workflowExecutionId, activeExecutionIdRef.current)
+            ) {
+              return;
+            }
             setEvents((prev) => {
               if (prev.some((e) => e.id === evt.id)) return prev;
               const next = [...prev, evt].sort((a, b) => a.sequenceId - b.sequenceId);
               return next;
             });
           } else if (msg.type === 'WORKFLOW_STATUS_CHANGED') {
-            if (!isTimeTraveling) {
-              setWorkflowStatus(msg.data.status);
+            if (isTimeTravelingRef.current) return;
+            if (!isMessageForActiveExecution(msg.data.executionId, activeExecutionIdRef.current)) {
+              return;
             }
+            setWorkflowStatus(msg.data.status);
           }
         } catch {
           // Ignored
@@ -125,10 +178,52 @@ export function useWorkflowEngine() {
     connect();
 
     return () => {
-      clearTimeout(reconnectTimeout);
-      if (ws) ws.close();
+      shouldReconnect = false;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      ws?.close();
+      wsRef.current = null;
     };
-  }, [fetchWorkflows, isTimeTraveling, isHistoricalView]);
+  }, [fetchWorkflows]);
+
+  // Backfill the event log after a trigger so events emitted before the response
+  // (or before the WebSocket connected) are not lost.
+  const backfillEvents = useCallback(async (executionId: string) => {
+    try {
+      const res = await fetch(`/api/executions/${executionId}/events`);
+      if (res.ok) {
+        const eventList: EventRecord[] = await res.json();
+        setEvents((prev) => {
+          const byId = new Map(prev.map((evt) => [evt.id, evt]));
+          for (const evt of eventList) byId.set(evt.id, evt);
+          return [...byId.values()].sort((a, b) => a.sequenceId - b.sequenceId);
+        });
+      }
+    } catch (err) {
+      console.error('Failed to backfill events:', err);
+    }
+  }, []);
+
+  // Re-read the durable execution snapshot to cover telemetry frames that arrived
+  // before the trigger response assigned the active execution id.
+  const refreshExecution = useCallback(async (executionId: string) => {
+    try {
+      const res = await fetch(`/api/executions/${executionId}`);
+      if (!res.ok) return;
+      const exec = await res.json();
+      setWorkflowStatus(exec.status);
+      // Do not clear live state with an empty in-flight DB snapshot.
+      if (exec.nodeStates && Object.keys(exec.nodeStates).length > 0) {
+        setNodeStates(exec.nodeStates);
+      }
+      if (exec.contextState && Object.keys(exec.contextState).length > 0) {
+        setContextState(exec.contextState);
+      }
+      setActiveFencingToken((prev) => Math.max(prev, Number(exec.activeFencingToken) || 0));
+      if (exec.chaosConfig) setActiveChaosConfig(exec.chaosConfig);
+    } catch (err) {
+      console.error('Failed to refresh execution:', err);
+    }
+  }, []);
 
   // Trigger new execution
   const triggerWorkflow = async (defId?: string, customInput?: any, chaosConfig?: ChaosConfig) => {
@@ -137,13 +232,13 @@ export function useWorkflowEngine() {
       : selectedWorkflow;
     if (!targetDef) return;
 
-    // Reset local view
-    setEvents([]);
-    setIsTimeTraveling(false);
-    setTimeTravelData(null);
-    setNodeStates({});
-    setIsHistoricalView(false);
+    // Reset local view and detach from the previous execution before the request.
+    setActiveExecution(null);
+    setHistoricalView(false);
     setHistoricalExecution(null);
+    setTimeTraveling(false);
+    setTimeTravelData(null);
+    resetDerivedState();
     setActiveChaosConfig(chaosConfig || null);
 
     try {
@@ -157,8 +252,11 @@ export function useWorkflowEngine() {
       });
       const data = await res.json();
       if (data.success && data.executionId) {
-        setActiveExecutionId(data.executionId);
-        setWorkflowStatus('RUNNING');
+        setActiveExecution(data.executionId);
+        setWorkflowStatus(data.status || 'RUNNING');
+        setTimeTravelSequence(1);
+        void backfillEvents(data.executionId);
+        void refreshExecution(data.executionId);
       }
     } catch (err) {
       console.error('Trigger workflow failed:', err);
@@ -190,19 +288,33 @@ export function useWorkflowEngine() {
       }
 
       // 4. Update state to reflect past test run
-      setActiveExecutionId(exec.id);
+      setActiveExecution(exec.id);
+      setHistoricalView(true);
+      setTimeTraveling(false);
+      setTimeTravelData(null);
       setWorkflowStatus(exec.status);
       setNodeStates(exec.nodeStates || {});
       setContextState(exec.contextState || {});
       setActiveChaosConfig(exec.chaosConfig || null);
       setActiveFencingToken(exec.activeFencingToken || 0);
+      setActiveLeases([]);
+
+      const nodeStateValues = Object.values(exec.nodeStates || {}) as NodeRuntimeState[];
+      setMetrics({
+        totalNodes: nodeStateValues.length,
+        completedNodes: nodeStateValues.filter((s) => s.status === 'COMPLETED').length,
+        failedNodes: nodeStateValues.filter((s) => s.status === 'FAILED').length,
+        compensatedNodes: nodeStateValues.filter((s) => s.status === 'COMPENSATED').length,
+        zombieWritesBlocked: eventList.filter((evt) => evt.eventType === 'WorkerFencingRejected')
+          .length,
+        crashesRecovered: eventList.filter((evt) => evt.eventType === 'WorkflowRecoveredFromCrash')
+          .length,
+      });
+
       setEvents(eventList);
-      setIsHistoricalView(true);
       setHistoricalExecution(exec);
 
       // Reset time travel scrubber to final sequence
-      setIsTimeTraveling(false);
-      setTimeTravelData(null);
       if (eventList.length > 0) {
         setTimeTravelSequence(eventList[eventList.length - 1].sequenceId);
       }
@@ -214,16 +326,16 @@ export function useWorkflowEngine() {
   };
 
   const exitHistoricalView = () => {
-    setIsHistoricalView(false);
+    setHistoricalView(false);
     setHistoricalExecution(null);
-    setIsTimeTraveling(false);
+    setTimeTraveling(false);
     setTimeTravelData(null);
   };
 
   // Time-Travel Scrubber function
   const scrubToSequence = async (seq: number) => {
     if (!activeExecutionId) return;
-    setIsTimeTraveling(true);
+    setTimeTraveling(true);
     setTimeTravelSequence(seq);
 
     try {
@@ -242,26 +354,29 @@ export function useWorkflowEngine() {
   };
 
   const exitTimeTravel = () => {
-    setIsTimeTraveling(false);
+    setTimeTraveling(false);
     setTimeTravelData(null);
   };
 
   // Simulation Controls
-  const triggerZombieDelay = async (nodeId: string) => {
-    if (!activeExecutionId) return;
-    try {
-      const res = await fetch(`/api/executions/${activeExecutionId}/simulate-zombie`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nodeId }),
-      });
-      return await res.json();
-    } catch (err) {
-      console.error('Zombie simulation error:', err);
-    }
-  };
+  const triggerZombieDelay = useCallback(
+    async (nodeId: string) => {
+      if (!activeExecutionId) return;
+      try {
+        const res = await fetch(`/api/executions/${activeExecutionId}/simulate-zombie`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nodeId }),
+        });
+        return await res.json();
+      } catch (err) {
+        console.error('Zombie simulation error:', err);
+      }
+    },
+    [activeExecutionId]
+  );
 
-  const triggerSimulatedCrash = async () => {
+  const triggerSimulatedCrash = useCallback(async () => {
     if (!activeExecutionId) return;
     try {
       const res = await fetch(`/api/executions/${activeExecutionId}/simulate-crash`, {
@@ -271,7 +386,7 @@ export function useWorkflowEngine() {
     } catch (err) {
       console.error('Crash simulation error:', err);
     }
-  };
+  }, [activeExecutionId]);
 
   return {
     workflows,

@@ -1,4 +1,5 @@
-import { integer, jsonb, pgTable, text, timestamp } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+import { index, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
 import type { ChaosConfig, EventType, NodeRuntimeState, WorkflowStatus } from '../core/types';
 
 // Workflow Definitions Table
@@ -32,45 +33,62 @@ export const workflowExecutionsTable = pgTable('workflow_executions', {
 });
 
 // Append-only Event Log Table
-export const eventLogTable = pgTable('event_log', {
-  id: text('id').primaryKey(),
-  workflowExecutionId: text('workflow_execution_id').notNull(),
-  sequenceId: integer('sequence_id').notNull(),
-  nodeId: text('node_id'),
-  eventType: text('event_type').$type<EventType>().notNull(),
-  payload: jsonb('payload').notNull(),
-  metadata: jsonb('metadata').notNull(),
-  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
-});
+export const eventLogTable = pgTable(
+  'event_log',
+  {
+    id: text('id').primaryKey(),
+    workflowExecutionId: text('workflow_execution_id').notNull(),
+    sequenceId: integer('sequence_id').notNull(),
+    nodeId: text('node_id'),
+    eventType: text('event_type').$type<EventType>().notNull(),
+    payload: jsonb('payload').notNull(),
+    metadata: jsonb('metadata').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [uniqueIndex('idx_event_log_exec_seq_unique').on(t.workflowExecutionId, t.sequenceId)]
+);
 
 // Worker Leases & Fencing Tokens Table
-export const workerLeasesTable = pgTable('worker_leases', {
-  id: text('id').primaryKey(), // `${executionId}:${nodeId}`
-  workflowExecutionId: text('workflow_execution_id').notNull(),
-  nodeId: text('node_id').notNull(),
-  workerId: text('worker_id').notNull(),
-  fencingToken: integer('fencing_token').notNull(),
-  ttlMs: integer('ttl_ms').notNull(),
-  status: text('status').default('active').notNull(),
-  acquiredAt: timestamp('acquired_at', { withTimezone: true }).notNull(),
-  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
-  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
-});
+export const workerLeasesTable = pgTable(
+  'worker_leases',
+  {
+    id: text('id').primaryKey(), // `${executionId}:${nodeId}`
+    workflowExecutionId: text('workflow_execution_id').notNull(),
+    nodeId: text('node_id').notNull(),
+    workerId: text('worker_id').notNull(),
+    fencingToken: integer('fencing_token').notNull(),
+    ttlMs: integer('ttl_ms').notNull(),
+    status: text('status').default('active').notNull(),
+    acquiredAt: timestamp('acquired_at', { withTimezone: true }).notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [index('idx_worker_leases_expires').on(t.expiresAt)]
+);
 
 // Poison Pill Quarantine Queue Table
-export const poisonPillQueueTable = pgTable('poison_pill_queue', {
-  id: text('id').primaryKey(),
-  workflowExecutionId: text('workflow_execution_id').notNull(),
-  nodeId: text('node_id').notNull(),
-  activityType: text('activity_type').notNull(),
-  compensationType: text('compensation_type').notNull(),
-  attempts: integer('attempts').notNull(),
-  lastError: text('last_error').notNull(),
-  payload: jsonb('payload').notNull(),
-  status: text('status').default('PENDING').notNull(), // PENDING | RESOLVED | SKIPPED
-  blockedAt: timestamp('blocked_at', { withTimezone: true }).defaultNow().notNull(),
-  resolvedAt: timestamp('resolved_at', { withTimezone: true }),
-});
+export const poisonPillQueueTable = pgTable(
+  'poison_pill_queue',
+  {
+    id: text('id').primaryKey(),
+    workflowExecutionId: text('workflow_execution_id').notNull(),
+    nodeId: text('node_id').notNull(),
+    activityType: text('activity_type').notNull(),
+    compensationType: text('compensation_type').notNull(),
+    attempts: integer('attempts').notNull(),
+    lastError: text('last_error').notNull(),
+    payload: jsonb('payload').notNull(),
+    status: text('status').default('PENDING').notNull(), // PENDING | RESOLVED | SKIPPED
+    blockedAt: timestamp('blocked_at', { withTimezone: true }).defaultNow().notNull(),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('idx_poison_pill_status').on(t.status),
+    uniqueIndex('idx_poison_pill_pending_unique')
+      .on(t.workflowExecutionId, t.nodeId)
+      .where(sql`${t.status} = 'PENDING'`),
+  ]
+);
 
 export type WorkflowDefinitionRecord = typeof workflowDefinitionsTable.$inferSelect;
 export type WorkflowExecutionRecord = typeof workflowExecutionsTable.$inferSelect;

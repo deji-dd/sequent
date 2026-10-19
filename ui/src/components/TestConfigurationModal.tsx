@@ -1,6 +1,6 @@
 import type { ChaosConfig, WorkflowDefinition } from '@core/types';
 import { Play } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import {
@@ -50,7 +50,7 @@ export function TestConfigurationModal({
 
   // Selected workflow
   const activeWorkflow = selectedWorkflow || workflows[0];
-  const taskNodes = activeWorkflow?.nodes || [];
+  const taskNodes = useMemo(() => activeWorkflow?.nodes || [], [activeWorkflow]);
 
   // Update default node targets when workflow changes
   useEffect(() => {

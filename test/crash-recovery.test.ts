@@ -40,7 +40,6 @@ describe('Zero-Loss Crash Recovery via Event Replay', () => {
     // Commit Step 1 completion event simulating that Step 1 completed before crash occurred
     await workflowRepository.appendEvent({
       workflowExecutionId: execId,
-      sequenceId: 1,
       eventType: 'WorkflowExecutionStarted',
       payload: { inputPayload: { orderId: 999 } },
       metadata: { timestamp: Date.now() },
@@ -48,7 +47,6 @@ describe('Zero-Loss Crash Recovery via Event Replay', () => {
 
     await workflowRepository.appendEvent({
       workflowExecutionId: execId,
-      sequenceId: 2,
       nodeId: 'step_1',
       eventType: 'ActivityCompleted',
       payload: { result: { processed: true, value: 'historical_result_42' } },

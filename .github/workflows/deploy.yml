@@ -14,6 +14,10 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
 jobs:
   validate-and-test:
     name: Validate & Test
@@ -31,14 +35,17 @@ jobs:
       - name: Install Dependencies
         run: bun install --frozen-lockfile
 
-      - name: Run Typecheck
-        run: bun run typecheck
+      - name: Run Bun Check
+        run: bun run check
 
       - name: Run Linter
-        run: bun run lint
+        run: bun run lint:ci
 
       - name: Run Tests
         run: bun test
+
+      - name: Build Frontend
+        run: bun run build
 
   build-and-push:
     name: Build & Push Container Image
@@ -118,6 +125,10 @@ jobs:
           ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_HOST} "bash -s" << EOF
             set -euo pipefail
             cd ${DEPLOY_DIR}
+            if [ ! -f ".env" ]; then
+              echo "Missing ${DEPLOY_DIR}/.env. Run 'bun run sync:env' locally before deploying."
+              exit 1
+            fi
             echo "Pulling updated Docker image from ghcr.io..."
             docker compose pull
             echo "Running database migrations..."

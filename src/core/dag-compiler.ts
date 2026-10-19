@@ -31,6 +31,16 @@ export class DAGCompiler {
       if (nodeMap.has(node.id)) {
         throw new DAGCompilationError(`Duplicate node ID detected: ${node.id}`);
       }
+      if (!/^[A-Za-z0-9_-]+$/.test(node.id)) {
+        throw new DAGCompilationError(
+          `Invalid node ID '${node.id}': only letters, numbers, '_' and '-' are allowed (':' is reserved for lease keys).`
+        );
+      }
+      if (node.type === 'conditional') {
+        throw new DAGCompilationError(
+          `Conditional node '${node.id}' is not supported by this engine yet. Use a task node or remove the conditional type.`
+        );
+      }
       nodeMap.set(node.id, node);
     }
 
@@ -53,6 +63,14 @@ export class DAGCompiler {
       }
       if (edge.source === edge.target) {
         throw new DAGCompilationError(`Self-loop detected on node: ${edge.source}`);
+      }
+      if (edge.condition) {
+        throw new DAGCompilationError(
+          `Edge '${edge.id}' uses a condition expression, which this engine does not evaluate yet. Remove the condition or use a task node.`
+        );
+      }
+      if (edgeMap.has(edge.id)) {
+        throw new DAGCompilationError(`Duplicate edge ID detected: ${edge.id}`);
       }
 
       edgeMap.set(edge.id, edge);

@@ -1,19 +1,13 @@
 import { type RamCache, ramCache } from '../cache';
 import { workflowRepository } from '../db/repository';
+import { FencingTokenMismatchError, LeaseUnavailableError } from './errors';
 import type { WorkerLease } from './types';
 
-export class FencingTokenMismatchError extends Error {
-  constructor(
-    public readonly expectedToken: number,
-    public readonly actualToken: number,
-    public readonly nodeId: string,
-    public readonly workerId: string
-  ) {
-    super(
-      `Worker fencing token mismatch on node '${nodeId}': worker token ${actualToken} is stale. Active/highest lease token is ${expectedToken}. Write rejected to prevent split-brain.`
-    );
-    this.name = 'FencingTokenMismatchError';
-  }
+export { FencingTokenMismatchError, LeaseUnavailableError };
+
+export interface AcquireLeaseOptions {
+  /** Bypass the live-lease check. Only the chaos simulation and explicit failover should use this. */
+  force?: boolean;
 }
 
 export class LeaseManager {
@@ -33,15 +27,42 @@ export class LeaseManager {
   }
 
   /**
+   * Reads the current lease from the RAM cache with a durable database fallback.
+   */
+  async getCurrentLease(executionId: string, nodeId: string): Promise<WorkerLease | null> {
+    const raw = await this.cache.get(this.getLeaseKey(executionId, nodeId));
+    if (raw) {
+      try {
+        return JSON.parse(raw) as WorkerLease;
+      } catch {
+        // fall through to DB
+      }
+    }
+    return workflowRepository.getLease(executionId, nodeId);
+  }
+
+  /**
    * Acquires a distributed lease with a strictly monotonic incrementing fencing token.
-   * Utilizes high-speed RAM cache with durable database fallback.
+   * By default it refuses to steal a live lease held by another worker.
    */
   async acquireLease(
     executionId: string,
     nodeId: string,
     workerId: string,
-    ttlMs = 4000
+    ttlMs = 4000,
+    options: AcquireLeaseOptions = {}
   ): Promise<WorkerLease> {
+    const existing = await this.getCurrentLease(executionId, nodeId);
+    if (
+      !options.force &&
+      existing &&
+      existing.status === 'active' &&
+      existing.expiresAt > Date.now() &&
+      existing.workerId !== workerId
+    ) {
+      throw new LeaseUnavailableError(nodeId, workerId, existing.workerId, existing.expiresAt);
+    }
+
     const leaseKey = this.getLeaseKey(executionId, nodeId);
     const fencingKey = this.getFencingSeqKey(executionId, nodeId);
 
@@ -77,14 +98,14 @@ export class LeaseManager {
     const mapKey = `${executionId}:${nodeId}`;
     this.activeLocalLeases.set(mapKey, leaseData);
 
-    // 2. Persist to DB fallback asynchronously
+    // 2. Persist to DB fallback
     await workflowRepository.saveLease(leaseData);
 
     return leaseData;
   }
 
   /**
-   * Heartbeat to extend lease TTL. Fails if lease was revoked or stolen by a higher token.
+   * Heartbeat to extend lease TTL. Fails if lease was revoked, expired, or stolen by a higher token.
    */
   async heartbeat(
     executionId: string,
@@ -93,29 +114,13 @@ export class LeaseManager {
     fencingToken: number,
     extensionTtlMs = 4000
   ): Promise<boolean> {
-    const leaseKey = this.getLeaseKey(executionId, nodeId);
-    const raw = await this.cache.get(leaseKey);
+    const currentLease = await this.getCurrentLease(executionId, nodeId);
 
-    let currentLease: WorkerLease | null = null;
-    if (raw) {
-      try {
-        currentLease = JSON.parse(raw);
-      } catch {
-        currentLease = null;
-      }
-    }
-
-    // Fallback to DB if absent from RAM cache
-    if (!currentLease) {
-      currentLease = await workflowRepository.getLease(executionId, nodeId);
-    }
-
-    if (!currentLease || currentLease.status !== 'active') {
+    if (currentLease?.status !== 'active') {
       return false;
     }
 
     if (currentLease.expiresAt < Date.now()) {
-      // Lease has expired
       return false;
     }
 
@@ -127,7 +132,12 @@ export class LeaseManager {
     currentLease.expiresAt = Date.now() + extensionTtlMs;
 
     // Update RAM cache
-    await this.cache.set(leaseKey, JSON.stringify(currentLease), 'PX', extensionTtlMs);
+    await this.cache.set(
+      this.getLeaseKey(executionId, nodeId),
+      JSON.stringify(currentLease),
+      'PX',
+      extensionTtlMs
+    );
 
     const mapKey = `${executionId}:${nodeId}`;
     this.activeLocalLeases.set(mapKey, currentLease);
@@ -149,7 +159,6 @@ export class LeaseManager {
     claimedToken: number
   ): Promise<boolean> {
     const fencingKey = this.getFencingSeqKey(executionId, nodeId);
-    const leaseKey = this.getLeaseKey(executionId, nodeId);
 
     // 1. Check highest allocated fencing token (RAM cache with DB fallback)
     const currentFencingSeqRaw = await this.cache.get(fencingKey);
@@ -164,29 +173,35 @@ export class LeaseManager {
     }
 
     // 2. Check active lease (RAM cache with DB fallback)
-    let activeLease: WorkerLease | null = null;
-    const activeLeaseRaw = await this.cache.get(leaseKey);
-    if (activeLeaseRaw) {
-      try {
-        activeLease = JSON.parse(activeLeaseRaw);
-      } catch {
-        activeLease = null;
-      }
-    }
+    const activeLease = await this.getCurrentLease(executionId, nodeId);
 
-    if (!activeLease) {
-      activeLease = await workflowRepository.getLease(executionId, nodeId);
-    }
-
-    if (!activeLease || activeLease.status !== 'active' || activeLease.expiresAt < Date.now()) {
-      throw new FencingTokenMismatchError(highestFencingToken, claimedToken, nodeId, workerId);
-    }
-
-    if (activeLease.fencingToken !== claimedToken || activeLease.workerId !== workerId) {
-      throw new FencingTokenMismatchError(activeLease.fencingToken, claimedToken, nodeId, workerId);
+    if (
+      activeLease?.status !== 'active' ||
+      activeLease.expiresAt < Date.now() ||
+      activeLease.fencingToken !== claimedToken ||
+      activeLease.workerId !== workerId
+    ) {
+      throw new FencingTokenMismatchError(
+        activeLease?.fencingToken ?? highestFencingToken,
+        claimedToken,
+        nodeId,
+        workerId
+      );
     }
 
     return true;
+  }
+
+  /**
+   * Marks a lease expired (used by the heartbeat watchdog and crash recovery).
+   */
+  async expireLease(executionId: string, nodeId: string): Promise<void> {
+    const lease = await this.getCurrentLease(executionId, nodeId);
+    await this.cache.del(this.getLeaseKey(executionId, nodeId));
+    this.activeLocalLeases.delete(`${executionId}:${nodeId}`);
+    if (lease) {
+      await workflowRepository.expireLease(executionId, nodeId);
+    }
   }
 
   /**
@@ -198,28 +213,15 @@ export class LeaseManager {
     workerId: string,
     fencingToken: number
   ): Promise<void> {
-    const leaseKey = this.getLeaseKey(executionId, nodeId);
-    const raw = await this.cache.get(leaseKey);
+    const lease = await this.getCurrentLease(executionId, nodeId);
 
-    let shouldRelease = false;
-    if (raw) {
-      try {
-        const lease: WorkerLease = JSON.parse(raw);
-        if (lease.workerId === workerId && lease.fencingToken === fencingToken) {
-          shouldRelease = true;
-        }
-      } catch {
-        // Ignored
-      }
-    } else {
-      const dbLease = await workflowRepository.getLease(executionId, nodeId);
-      if (dbLease && dbLease.workerId === workerId && dbLease.fencingToken === fencingToken) {
-        shouldRelease = true;
-      }
-    }
+    const shouldRelease =
+      lease?.workerId === workerId &&
+      lease?.fencingToken === fencingToken &&
+      lease?.status === 'active';
 
     if (shouldRelease) {
-      await this.cache.del(leaseKey);
+      await this.cache.del(this.getLeaseKey(executionId, nodeId));
       await workflowRepository.releaseLease(executionId, nodeId);
     }
 
@@ -231,6 +233,7 @@ export class LeaseManager {
    * Lists all currently tracked active leases
    */
   getActiveLeases(): WorkerLease[] {
+    this.cache.sweep();
     const now = Date.now();
     const active: WorkerLease[] = [];
     for (const [key, lease] of this.activeLocalLeases.entries()) {

@@ -27,7 +27,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.4
 
       - name: Install Dependencies
         run: bun install --frozen-lockfile
@@ -35,8 +35,8 @@ jobs:
       - name: Run Bun Check
         run: bun run check
 
-      - name: Run Linter
-        run: bun run lint:ci
+      - name: Check Formatting
+        run: bun run format:check
 
       - name: Run Tests
         run: bun test

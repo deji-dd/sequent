@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it } from 'bun:test';
+
 import { app, ready } from '../src/index';
 
 describe('Sequent Elysia API Server (E2E)', () => {

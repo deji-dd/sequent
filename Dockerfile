@@ -1,5 +1,5 @@
 # Multi-stage optimized Bun Dockerfile for Sequent
-FROM oven/bun:latest AS base
+FROM oven/bun:1.4.4 AS base
 WORKDIR /app
 
 # Install all dependencies (including dev deps, required to build the UI)

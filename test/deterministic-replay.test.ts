@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+
 import { DeterministicProxy } from '../src/core/deterministic-proxy';
 import type { EventRecord } from '../src/core/types';
 

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+
 import { isMessageForActiveExecution } from '../ui/src/lib/telemetry';
 
 describe('Telemetry execution scoping', () => {

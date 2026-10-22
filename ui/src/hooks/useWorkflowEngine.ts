@@ -8,6 +8,7 @@ import type {
   WorkflowStatus,
 } from '@core/types';
 import { useCallback, useEffect, useRef, useState } from 'react';
+
 import { isMessageForActiveExecution } from '../lib/telemetry';
 
 const EMPTY_METRICS = {

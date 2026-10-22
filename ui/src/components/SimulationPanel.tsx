@@ -1,6 +1,7 @@
 import type { ChaosConfig, WorkflowStatus } from '@core/types';
 import { Clock, Sparkles } from 'lucide-react';
 import { useState } from 'react';
+
 import { Badge } from './ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
 

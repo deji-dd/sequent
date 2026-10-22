@@ -1,6 +1,7 @@
 import type { EventRecord } from '@core/types';
 import { ChevronRight, Search } from 'lucide-react';
 import { useState } from 'react';
+
 import { formatTime } from '../lib/utils';
 import { Badge } from './ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+
 import { DAGCompiler } from '../src/core/dag-compiler';
 import type { WorkflowDefinition } from '../src/core/types';
 

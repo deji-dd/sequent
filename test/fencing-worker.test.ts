@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+
 import { FencingTokenMismatchError, leaseManager } from '../src/core/lease-manager';
 
 describe('Worker Fencing & Split-Brain Prevention', () => {

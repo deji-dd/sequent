@@ -1,6 +1,7 @@
 import type { EventRecord } from '@core/types';
 import { Pause, Play, SkipBack, SkipForward } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
+
 import { formatTime } from '../lib/utils';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';

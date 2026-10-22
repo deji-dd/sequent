@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+
 import { projectEvents } from '../src/core/replay';
 import type { EventRecord, WorkflowDefinition } from '../src/core/types';
 

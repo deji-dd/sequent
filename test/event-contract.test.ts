@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
+
 import { ramCache } from '../src/cache';
 import {
   FencingTokenMismatchError,
-  LeaseUnavailableError,
   leaseManager,
+  LeaseUnavailableError,
 } from '../src/core/lease-manager';
 import { workflowRepository } from '../src/db/repository';
 

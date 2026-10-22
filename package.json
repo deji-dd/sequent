@@ -4,6 +4,7 @@
   "description": "Event-sourced distributed workflow engine and visual execution debugger with deterministic replay, worker fencing, and saga compensation",
   "main": "src/index.ts",
   "type": "module",
+  "packageManager": "bun@1.4.4",
   "scripts": {
     "dev": "NODE_ENV=development bun --env-file=.env.development --watch src/index.ts",
     "dev:ui": "NODE_ENV=development vite",
@@ -13,10 +14,8 @@
     "test:pg": "bun test test/postgres-sequencing.test.ts",
     "check": "bun check",
     "typecheck": "bun check",
-    "lint": "biome check .",
-    "lint:ci": "biome check --error-on-warnings .",
-    "lint:fix": "biome check --write .",
-    "format": "biome format --write .",
+    "format": "bun fmt",
+    "format:check": "bun fmt --check",
     "sync:env": "bash scripts/sync-env.sh",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "bun run src/db/migrate.ts",
@@ -44,7 +43,6 @@
     "tw-animate-css": "latest"
   },
   "devDependencies": {
-    "@biomejs/biome": "latest",
     "@tailwindcss/vite": "latest",
     "@types/bun": "latest",
     "@types/react": "latest",

@@ -3,7 +3,7 @@ import { cancellationHub } from './cancellation-hub';
 import { type CompiledDAG, DAGCompiler } from './dag-compiler';
 import { DeterministicProxy, isAbortError } from './deterministic-proxy';
 import { PoisonPillResolutionError } from './errors';
-import { FencingTokenMismatchError, LeaseUnavailableError, leaseManager } from './lease-manager';
+import { FencingTokenMismatchError, leaseManager, LeaseUnavailableError } from './lease-manager';
 import { projectEvents } from './replay';
 import { sagaCompensator } from './saga-compensator';
 import { telemetryBroadcaster } from './telemetry';

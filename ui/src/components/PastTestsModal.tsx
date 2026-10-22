@@ -14,6 +14,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
+
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import { Card, CardContent } from './ui/card';
@@ -208,10 +209,10 @@ export function PastTestsModal({
   const hasChaos = (chaosConfig?: any) =>
     Boolean(
       chaosConfig &&
-        (chaosConfig.zombieNodeId ||
-          chaosConfig.crashNodeId ||
-          chaosConfig.failNodeId ||
-          chaosConfig.poisonPillNodeId)
+      (chaosConfig.zombieNodeId ||
+        chaosConfig.crashNodeId ||
+        chaosConfig.failNodeId ||
+        chaosConfig.poisonPillNodeId)
     );
 
   const filteredExecutions = executions.filter((ex) => {
